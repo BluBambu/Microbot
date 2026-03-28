@@ -54,6 +54,9 @@ public class MicrobotApi {
     public UUID microbotOpen() throws IOException {
         try (Response response = client.newCall(new Request.Builder().url(microbotApiUrl + "/session").build()).execute()) {
             ResponseBody body = response.body();
+            if (body == null) {
+                throw new IOException("Response body is null");
+            }
 
             InputStream in = body.byteStream();
             return gson.fromJson(new InputStreamReader(in, StandardCharsets.UTF_8), UUID.class);

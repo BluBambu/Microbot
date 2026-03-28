@@ -394,6 +394,10 @@ public class Rs2BoatModel implements WorldEntity, IEntity {
     public int getDirection(WorldPoint target)
     {
         WorldPoint current = getPlayerBoatLocation();
+        if (current == null)
+        {
+            return Heading.SOUTH.getValue();
+        }
         int deltaX = target.getX() - current.getX();
         int deltaY = target.getY() - current.getY();
 

@@ -122,8 +122,10 @@ public class Rs2Widget {
     }
 
     public static int getChildWidgetSpriteID(int id, int childId) {
-        return Microbot.getClientThread().runOnClientThreadOptional(() -> Microbot.getClient().getWidget(id, childId).getSpriteId())
-                .orElse(0);
+        return Microbot.getClientThread().runOnClientThreadOptional(() -> {
+            Widget widget = Microbot.getClient().getWidget(id, childId);
+            return widget != null ? widget.getSpriteId() : null;
+        }).orElse(0);
     }
 
     public static String getChildWidgetText(int id, int childId) {
@@ -142,9 +144,11 @@ public class Rs2Widget {
     }
 
     public static boolean clickChildWidget(int id, int childId) {
-        Widget widget = Microbot.getClientThread().runOnClientThreadOptional(() -> Microbot.getClient().getWidget(id)).orElse(null);;
+        Widget widget = Microbot.getClientThread().runOnClientThreadOptional(() -> Microbot.getClient().getWidget(id)).orElse(null);
         if (widget == null) return false;
-        Microbot.getMouse().click(widget.getChild(childId).getBounds());
+        Widget child = widget.getChild(childId);
+        if (child == null) return false;
+        Microbot.getMouse().click(child.getBounds());
         return true;
     }
 

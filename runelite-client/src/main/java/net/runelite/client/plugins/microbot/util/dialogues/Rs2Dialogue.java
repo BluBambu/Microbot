@@ -197,7 +197,7 @@ public class Rs2Dialogue {
         Widget dialogueOption = Rs2Widget.getWidget(InterfaceID.DIALOG_OPTION, 1);
         if (dialogueOption == null) return false;
         Widget[] dynamicWidgetOptions = dialogueOption.getDynamicChildren();
-        if (dynamicWidgetOptions[0] == null) return false;
+        if (dynamicWidgetOptions == null || dynamicWidgetOptions.length == 0 || dynamicWidgetOptions[0] == null) return false;
 
         if (exact) {
             return dynamicWidgetOptions[0].getText().equalsIgnoreCase(text);
@@ -229,10 +229,11 @@ public class Rs2Dialogue {
         Widget dialogueOption = Rs2Widget.getWidget(InterfaceID.DIALOG_OPTION, 1);
         if (dialogueOption == null) return new ArrayList<>();
         Widget[] dynamicWidgetOptions = dialogueOption.getDynamicChildren();
+        if (dynamicWidgetOptions == null) return new ArrayList<>();
 
         // Skip the first dynamic widget option, as it is never an option
         for (int i = 1; i < dynamicWidgetOptions.length; i++) {
-            if (dynamicWidgetOptions[i].getText().isBlank()) {
+            if (dynamicWidgetOptions[i] == null || dynamicWidgetOptions[i].getText().isBlank()) {
                 continue;
             }
 
