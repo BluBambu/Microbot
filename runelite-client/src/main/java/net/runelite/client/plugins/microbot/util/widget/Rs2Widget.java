@@ -568,11 +568,15 @@ public class Rs2Widget {
      * @return true if interaction was successful
      */
     public static boolean handleProcessingInterface( String actionText) {
-        if (!isWidgetVisible(InterfaceID.SKILLMULTI, 0)) {
+        Widget mainWidget = Microbot.getClientThread().runOnClientThreadOptional(() -> {
+            Widget widget = getWidget(InterfaceID.SKILLMULTI, 0);
+            if (widget == null || widget.isHidden()) return null;
+            return widget;
+        }).orElse(null);
+        if (mainWidget == null) {
             log.error("Processing interface not open");
             return false;
         }
-        Widget mainWidget = getWidget(InterfaceID.SKILLMULTI, 0);
      
 
         // enable quantity option if available
