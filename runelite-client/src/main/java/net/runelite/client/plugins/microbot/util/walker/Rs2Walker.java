@@ -170,224 +170,290 @@ public class Rs2Walker {
      * @param target
      * @param distance
      */
+    private static final int MAX_WALK_ITERATIONS = 100;
+
+    /**
+     * Core walk method. Iteratively walks the path, handling doors, transports,
+     * and obstacles until the target is reached or retries are exhausted.
+     */
     private static WalkerState processWalk(WorldPoint target, int distance) {
         if (debug) {
             return WalkerState.EXIT;
         }
-        try {
-            if (!Microbot.isLoggedIn()) {
+
+        for (int iteration = 0; iteration < MAX_WALK_ITERATIONS; iteration++) {
+            try {
+                if (!Microbot.isLoggedIn()) {
+                    setTarget(null);
+                    return WalkerState.EXIT;
+                }
+
+                Pathfinder pathfinder = awaitPathfinder();
+                if (pathfinder == null) {
+                    return WalkerState.EXIT;
+                }
+
+                List<WorldPoint> path = pathfinder.getPath();
+                WalkerState validationResult = validatePath(path, target, distance);
+                if (validationResult != null) {
+                    return validationResult;
+                }
+
+                if (isNear(path.get(path.size() - 1))) {
+                    setTarget(null);
+                }
+
+                handleStuckDetection();
+
+                int indexOfStartPoint = getClosestTileIndex(path);
+                if (indexOfStartPoint == -1) {
+                    setTarget(null);
+                    return WalkerState.EXIT;
+                }
+
+                lastPosition = Rs2Player.getWorldLocation();
+
+                if (Rs2Player.getWorldLocation().distanceTo(target) == 0 || path.size() <= 1) {
+                    setTarget(null);
+                    return WalkerState.ARRIVED;
+                }
+
+                handleWarningDialogues();
+                boolean handledObstacle = walkAlongPath(path, indexOfStartPoint, target, distance);
+                walkToFinalTile(handledObstacle, path, distance);
+
+                int finalDist = Rs2Player.getWorldLocation().distanceTo(target);
+                if (finalDist < distance) {
+                    setTarget(null);
+                    return WalkerState.ARRIVED;
+                }
+                // Not arrived yet — loop will retry
+            } catch (InterruptedException ex) {
+                log.info("Pathfinder was interrupted, exiting");
+                setTarget(null);
+                return WalkerState.EXIT;
+            } catch (Exception ex) {
+                log.error("Exception in Rs2Walker:", ex);
+            }
+        }
+
+        log.warn("Walker exceeded maximum iterations ({}), exiting", MAX_WALK_ITERATIONS);
+        setTarget(null);
+        return WalkerState.EXIT;
+    }
+
+    /**
+     * Waits for the pathfinder to be initialized and complete its calculation.
+     * @return the completed Pathfinder, or null if unavailable or timed out
+     */
+    private static Pathfinder awaitPathfinder() {
+        Pathfinder pathfinder = ShortestPathPlugin.getPathfinder();
+        if (pathfinder == null) {
+            if (ShortestPathPlugin.getMarker() == null) {
                 setTarget(null);
             }
-
-            Pathfinder pathfinder = ShortestPathPlugin.getPathfinder();
+            pathfinder = sleepUntilNotNull(ShortestPathPlugin::getPathfinder, 2_000);
             if (pathfinder == null) {
-                if (ShortestPathPlugin.getMarker() == null) {
-                    setTarget(null);
-                }
-                pathfinder = sleepUntilNotNull(ShortestPathPlugin::getPathfinder, 2_000);
-                if (pathfinder == null) {
-                    setTarget(null);
-                    return WalkerState.EXIT;
-                }
+                setTarget(null);
+                return null;
             }
+        }
 
-            if (!pathfinder.isDone()) {
-                boolean isDone = sleepUntilTrue(pathfinder::isDone, 100, 10_000);
-                if (!isDone) {
-                    setTarget(null);
-                    return WalkerState.EXIT;
-                }
+        if (!pathfinder.isDone()) {
+            boolean isDone = sleepUntilTrue(pathfinder::isDone, 100, 10_000);
+            if (!isDone) {
+                setTarget(null);
+                return null;
+            }
+        }
+
+        if (ShortestPathPlugin.getMarker() == null) {
+            setTarget(null);
+            return null;
+        }
+
+        return pathfinder;
+    }
+
+    /**
+     * Validates that the pathfinder produced a usable path to the target.
+     * @return a terminal WalkerState if the path is invalid, or null if the path is valid and walking should proceed
+     */
+    private static WalkerState validatePath(List<WorldPoint> path, WorldPoint target, int distance) {
+        WorldPoint dst;
+        if (path == null || path.isEmpty()) {
+            dst = Rs2Player.getWorldLocation();
+        } else {
+            dst = path.get(path.size() - 1);
+        }
+
+        if (dst == null || dst.distanceTo(target) > distance) {
+            setTarget(null);
+            return WalkerState.UNREACHABLE;
+        }
+
+        if (path == null || path.isEmpty()) {
+            return WalkerState.ARRIVED;
+        }
+
+        return null;
+    }
+
+    /**
+     * Detects if the player is stuck and attempts to move to a random nearby tile.
+     */
+    private static void handleStuckDetection() {
+        checkIfStuck();
+        if (stuckCount > 10) {
+            var moveableTiles = Rs2Tile.getReachableTilesFromTile(Rs2Player.getWorldLocation(), 5).keySet().toArray(new WorldPoint[0]);
+            if (moveableTiles.length > 0) {
+                walkMiniMap(moveableTiles[Rs2Random.between(0, moveableTiles.length)]);
+                sleepGaussian(1000, 300);
+                stuckCount = 0;
+            }
+        }
+    }
+
+    /**
+     * Dismisses any blocking warning dialogues encountered during walking
+     * (wilderness lever, desert entry, stronghold of security, wilderness entry).
+     */
+    private static void handleWarningDialogues() {
+        // Edgeville/ardy wilderness lever warning
+        if (Rs2Widget.isWidgetVisible(229, 1)) {
+            String dialogueText = Rs2Dialogue.getDialogueText();
+            if (dialogueText != null && dialogueText.equalsIgnoreCase("Warning! The lever will teleport you deep into the Wilderness.")) {
+                log.info("Detected Wilderness lever warning, interacting...");
+                Rs2Dialogue.clickContinue();
+                Rs2Dialogue.sleepUntilHasQuestion("Are you sure you wish to pull it?");
+                Rs2Dialogue.clickOption("Yes, I'm brave.");
+                sleep(1200, 2400);
+            }
+        }
+
+        // Entering desert warning
+        if (Rs2Widget.clickWidget(565, 20)) {
+            sleepUntil(() -> {
+                Widget checkBoxWidget = Rs2Widget.getWidget(565, 20);
+                if (checkBoxWidget == null) return false;
+                return checkBoxWidget.getSpriteId() != 941;
+            });
+            Rs2Widget.clickWidget(565, 17);
+        }
+
+        // Entering down ladder stronghold of security
+        if (Rs2Widget.clickWidget(579, 20)) {
+            sleepUntil(() -> {
+                Widget checkBoxWidget = Rs2Widget.getWidget(579, 20);
+                if (checkBoxWidget == null) return false;
+                return checkBoxWidget.getSpriteId() != 941;
+            });
+            Rs2Widget.clickWidget(579, 17);
+        }
+
+        if (Rs2Widget.enterWilderness()) {
+            sleepUntil(Rs2Player::isAnimating);
+        }
+    }
+
+    /**
+     * Iterates along the path from the start index, handling doors, rockfalls,
+     * transports, and minimap walking for each tile.
+     * @return true if a door, rockfall, or transport was handled (path interrupted)
+     */
+    private static boolean walkAlongPath(List<WorldPoint> path, int indexOfStartPoint, WorldPoint target, int distance) {
+        for (int i = indexOfStartPoint; i < path.size(); i++) {
+            WorldPoint currentWorldPoint = path.get(i);
+            if (config.drawDebugPanel()) {
+                WorldPoint nextWorldPoint = i + 1 < path.size() ? path.get(i + 1) : null;
+                log.debug("start loop {}, from={}, to={}", i, currentWorldPoint, nextWorldPoint);
             }
 
             if (ShortestPathPlugin.getMarker() == null) {
-                setTarget(null);
-                return WalkerState.EXIT;
+                log.debug("Marker is null, breaking path iteration");
+                break;
             }
 
-            final List<WorldPoint> path = pathfinder.getPath();
-            final WorldPoint dst;
-            if (path == null || path.isEmpty()) {
-                dst = Rs2Player.getWorldLocation();
-            } else {
-                dst = path.get(path.size()-1);
+            if (!isNearPath()) {
+                log.info("No longer near path");
+                if (config.cancelInstead()) {
+                    log.info("Cancel instead of recalculate");
+                    setTarget(null);
+                } else {
+                    recalculatePath();
+                }
+                break;
             }
 
-            if (dst == null || dst.distanceTo(target) > distance) {
-                setTarget(null);
-                return WalkerState.UNREACHABLE;
+            if (handleDoors(path, i)) {
+                log.debug("Break out of path loop: door handled");
+                return true;
             }
 
-            if (path == null || path.isEmpty()) {
-                return WalkerState.ARRIVED;
+            if (handleRockfall(path, i)) {
+                log.debug("Break out of path loop: rockfall handled");
+                return true;
             }
 
-            boolean nearDst = isNear(dst);
-            if (nearDst) {
-                setTarget(null);
-            }
-
-            checkIfStuck();
-            if (stuckCount > 10) {
-                var moveableTiles = Rs2Tile.getReachableTilesFromTile(Rs2Player.getWorldLocation(), 5).keySet().toArray(new WorldPoint[0]);
-                if (moveableTiles.length > 0) {
-                    walkMiniMap(moveableTiles[Rs2Random.between(0, moveableTiles.length)]);
-                    sleepGaussian(1000, 300);
-                    stuckCount = 0;
+            boolean inInstance = Microbot.getClient().getTopLevelWorldView().isInstance();
+            if (PohTeleports.isInHouse() || !inInstance) {
+                if (handleTransports(path, i)) {
+                    log.debug("Break out of path loop: transport handled");
+                    return true;
                 }
             }
 
-            int indexOfStartPoint = getClosestTileIndex(path);
-            if (indexOfStartPoint == -1) {
-                setTarget(null);
-                return WalkerState.EXIT;
+            if (!Rs2Tile.isTileReachable(currentWorldPoint) && !inInstance) {
+                continue;
             }
 
-            lastPosition = Rs2Player.getWorldLocation();
-
-            if (Rs2Player.getWorldLocation().distanceTo(target) == 0 || path.size() <= 1) {
-                setTarget(null);
-                return WalkerState.ARRIVED;
+            nextWalkingDistance = Rs2Random.between(7, 11);
+            int dist2d = currentWorldPoint.distanceTo2D(Rs2Player.getWorldLocation());
+            if (dist2d > nextWalkingDistance) {
+                walkToTile(currentWorldPoint, inInstance);
             }
-
-            // Edgeville/ardy wilderness lever warning
-            if (Rs2Widget.isWidgetVisible(229, 1)) {
-                if (Rs2Dialogue.getDialogueText().equalsIgnoreCase("Warning! The lever will teleport you deep into the Wilderness.")) {
-                    log.info("Detected Wilderness lever warning, interacting...");
-                    Rs2Dialogue.clickContinue();
-                    Rs2Dialogue.sleepUntilHasQuestion("Are you sure you wish to pull it?");
-                    Rs2Dialogue.clickOption("Yes, I'm brave.");
-                    sleep(1200, 2400);
-                }
-            }
-
-            // entering desert warning
-            if (Rs2Widget.clickWidget(565, 20)) {
-                sleepUntil(() -> {
-                    Widget checkBoxWidget = Rs2Widget.getWidget(565, 20);
-                    if (checkBoxWidget == null) return false;
-                    return checkBoxWidget.getSpriteId() != 941;
-                });
-                Rs2Widget.clickWidget(565, 17);
-            }
-
-            // entering down ladder strong hold of security
-            if (Rs2Widget.clickWidget(579, 20)) {
-                sleepUntil(() -> {
-                    Widget checkBoxWidget = Rs2Widget.getWidget(579, 20);
-                    if (checkBoxWidget == null) return false;
-                    return checkBoxWidget.getSpriteId() != 941;
-                });
-                Rs2Widget.clickWidget(579, 17);
-            }
-
-
-            if (Rs2Widget.enterWilderness()) {
-                sleepUntil(Rs2Player::isAnimating);
-            }
-
-            boolean doorOrTransportResult = false;
-            for (int i = indexOfStartPoint; i < path.size(); i++) {
-                WorldPoint currentWorldPoint = path.get(i);
-                WorldPoint nextWorldPoint = i + 1 < path.size() ? path.get(i + 1) : null;
-                if (config.drawDebugPanel()) {
-                    System.out.printf("start loop %s, from=%s, to=%s\n", i, currentWorldPoint, nextWorldPoint);
-                }
-
-				// add breakpoint here
-
-                if (ShortestPathPlugin.getMarker() == null) {
-                    System.out.println("marker is null");
-                    break;
-                }
-
-                if (!isNearPath()) {
-                    System.out.println("No longer near path");
-                    if (config.cancelInstead()) {
-                        System.out.println("cancel instead of recalculate");
-                        setTarget(null);
-                    } else {
-                        recalculatePath();
-                    }
-                    break;
-                }
-
-                doorOrTransportResult = handleDoors(path, i);
-                if (doorOrTransportResult) {
-                    System.out.println("break out of door");
-                    break;
-                }
-
-                doorOrTransportResult = handleRockfall(path, i);
-                if (doorOrTransportResult) {
-                    System.out.println("break out of rockfall");
-                    break;
-                }
-
-                //Again, would be nice to have access to current node, since we're going to have to handle transports in instance (PoH)
-                boolean inInstance = Microbot.getClient().getTopLevelWorldView().isInstance();
-                if (PohTeleports.isInHouse() || !inInstance) {
-                    doorOrTransportResult = handleTransports(path, i);
-                }
-
-                if (doorOrTransportResult) {
-                    System.out.println("break out of transport");
-                    break;
-                }
-
-                boolean tileReachable = Rs2Tile.isTileReachable(currentWorldPoint);
-                if (!tileReachable && !inInstance) {
-                    continue;
-                }
-                nextWalkingDistance = Rs2Random.between(7, 11);
-                int dist2d = currentWorldPoint.distanceTo2D(Rs2Player.getWorldLocation());
-                if (dist2d > nextWalkingDistance) {
-                    if (Microbot.getClient().getTopLevelWorldView().isInstance()) {
-                        if (Rs2Walker.walkMiniMap(currentWorldPoint)) {
-                            final WorldPoint b = currentWorldPoint;
-                            sleepUntil(() -> b.distanceTo2D(Rs2Player.getWorldLocation()) < nextWalkingDistance, 2000);
-                        }
-                    } else {
-                        if (currentWorldPoint.distanceTo2D(Rs2Player.getWorldLocation()) > nextWalkingDistance) {
-                            if (Rs2Walker.walkMiniMap(getPointWithWallDistance(currentWorldPoint))) {
-                                final WorldPoint b = currentWorldPoint;
-                                sleepUntil(() -> b.distanceTo2D(Rs2Player.getWorldLocation()) < nextWalkingDistance, 2000);
-                            }
-                        }
-                    }
-                }
-            }
-
-
-            if (!doorOrTransportResult) {
-                if (!path.isEmpty()) {
-                    var moveableTiles = Rs2Tile.getReachableTilesFromTile(path.get(path.size() - 1), Math.min(3, distance)).keySet().toArray(new WorldPoint[0]);
-                    var finalTile = (config.randomizeFinalTile() && moveableTiles.length > 0) ? moveableTiles[Rs2Random.between(0, moveableTiles.length)] : path.get(path.size() - 1);
-
-                    if (Rs2Tile.isTileReachable(finalTile)) {
-                        if (Rs2Walker.walkFastCanvas(finalTile)) {
-                            sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(finalTile) < 2, 3000);
-                        }
-                    }
-
-                }
-            }
-            int finalDist = Rs2Player.getWorldLocation().distanceTo(target);
-            if (finalDist < distance) {
-                setTarget(null);
-                return WalkerState.ARRIVED;
-            } else {
-                return processWalk(target, distance);
-            }
-        } catch (Exception ex) {
-            if (ex instanceof InterruptedException) {
-                log.info("Pathfinder was interrupted, exiting: 397");
-                setTarget(null);
-                return WalkerState.EXIT;
-            }
-            log.error("Exception in Rs2Walker:", ex);
         }
-        log.info("Exiting walker: 403");
-        return WalkerState.EXIT;
+        return false;
+    }
+
+    /**
+     * Walks toward a tile on the path using the minimap, handling instanced vs normal worlds.
+     */
+    private static void walkToTile(WorldPoint tile, boolean inInstance) {
+        if (inInstance) {
+            if (Rs2Walker.walkMiniMap(tile)) {
+                final WorldPoint target = tile;
+                sleepUntil(() -> target.distanceTo2D(Rs2Player.getWorldLocation()) < nextWalkingDistance, 2000);
+            }
+        } else {
+            if (tile.distanceTo2D(Rs2Player.getWorldLocation()) > nextWalkingDistance) {
+                if (Rs2Walker.walkMiniMap(getPointWithWallDistance(tile))) {
+                    final WorldPoint target = tile;
+                    sleepUntil(() -> target.distanceTo2D(Rs2Player.getWorldLocation()) < nextWalkingDistance, 2000);
+                }
+            }
+        }
+    }
+
+    /**
+     * Attempts to walk to the final tile of the path using canvas clicking,
+     * optionally randomizing the final tile position.
+     */
+    private static void walkToFinalTile(boolean handledObstacle, List<WorldPoint> path, int distance) {
+        if (handledObstacle || path.isEmpty()) {
+            return;
+        }
+
+        var moveableTiles = Rs2Tile.getReachableTilesFromTile(path.get(path.size() - 1), Math.min(3, distance)).keySet().toArray(new WorldPoint[0]);
+        var finalTile = (config.randomizeFinalTile() && moveableTiles.length > 0)
+                ? moveableTiles[Rs2Random.between(0, moveableTiles.length)]
+                : path.get(path.size() - 1);
+
+        if (Rs2Tile.isTileReachable(finalTile)) {
+            if (Rs2Walker.walkFastCanvas(finalTile)) {
+                sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(finalTile) < 2, 3000);
+            }
+        }
     }
 
     public static boolean walkNextTo(GameObject target) {
