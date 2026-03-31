@@ -127,7 +127,9 @@ public class QuestScript extends Script {
                         var widget = Rs2Widget.getWidget(widgetHighlight.getInterfaceID());
                         if (widget != null) {
                             if (widgetHighlight.getChildChildId() != -1) {
-                                var childWidget = widget.getChildren()[widgetHighlight.getChildChildId()];
+                                Widget[] children = widget.getChildren();
+                                if (children == null || widgetHighlight.getChildChildId() >= children.length) continue;
+                                var childWidget = children[widgetHighlight.getChildChildId()];
                                 if (childWidget != null) {
                                     Rs2Widget.clickWidget(childWidget.getId());
                                     return;
