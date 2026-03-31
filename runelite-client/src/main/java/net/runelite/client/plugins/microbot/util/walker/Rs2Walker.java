@@ -2948,92 +2948,86 @@ public class Rs2Walker {
 
         Map<Integer, Integer> itemQuantityMap = new HashMap<>();
 
-        transports.stream()
-                .forEach(transport -> {
-                    // Special handling for teleportation spells - use actual rune requirements
-                    if (transport.getType() == TransportType.TELEPORTATION_SPELL) {
-                        Map<Integer, Integer> spellRuneRequirements = getSpellRuneRequirements(transport);
-                        if (!spellRuneRequirements.isEmpty()) {
-                            // Check if any of the required runes are available in bank
-                            spellRuneRequirements.forEach((runeItemId, requiredQuantity) -> {
-                                try {
-                                    int bankQuantity = Rs2Bank.count(runeItemId);
-                                    if (bankQuantity >= requiredQuantity) {
-                                        int currentQuantity = itemQuantityMap.getOrDefault(runeItemId, 0);
-                                        itemQuantityMap.put(runeItemId, currentQuantity + requiredQuantity);
-                                        log.debug("Added teleportation spell rune requirement: {} (ID: {}) x{} (bank has: {})",
-                                                runeItemId, runeItemId, requiredQuantity, bankQuantity);
-                                    }
-                                } catch (Exception e) {
-                                    log.debug("Could not check bank for rune " + runeItemId + ": " + e.getMessage());
-                                }
+        for (Transport transport : transports) {
+            if (transport.getType() == TransportType.TELEPORTATION_SPELL) {
+                collectSpellRuneRequirements(transport, itemQuantityMap);
+                continue;
+            }
+
+            if (transport.getItemIdRequirements() == null) {
+                continue;
+            }
+
+            for (Set<Integer> alternativeItems : transport.getItemIdRequirements()) {
+                boolean hasAnyAlternative = alternativeItems.stream()
+                        .anyMatch(itemId -> isItemAvailableInBank(itemId, transport.getType(), transport.getCurrencyAmount()));
+
+                if (hasAnyAlternative) {
+                    alternativeItems.stream()
+                            .filter(itemId -> isItemAvailableInBank(itemId, transport.getType(), transport.getCurrencyAmount()))
+                            .findFirst()
+                            .ifPresent(itemId -> {
+                                int requiredQuantity = getRequiredQuantity(transport);
+                                int currentQuantity = itemQuantityMap.getOrDefault(itemId, 0);
+                                itemQuantityMap.put(itemId, currentQuantity + requiredQuantity);
                             });
-                        }
-                        return; // Skip normal item requirement processing for spell transports
-                    }
-
-                    // Normal processing for non-spell transports
-                    if (transport.getItemIdRequirements() != null) {
-                        for (Set<Integer> alternativeItems : transport.getItemIdRequirements()) {
-                            // For each alternative set, we need ANY one of these items
-                            // Check if we have any of the alternatives in bank
-                            boolean hasAnyAlternative = alternativeItems.stream()
-                                    .anyMatch(itemId -> {
-                                        try {
-                                            if (isCurrencyBasedTransport(transport.getType()) && transport.getCurrencyAmount() > 0) {
-                                                // For currency-based transports, check if we have enough currency
-                                                return Rs2Bank.count(itemId) >= transport.getCurrencyAmount();
-                                            } else {
-                                                // For regular items, just check if we have the item
-                                                return Rs2Bank.hasItem(itemId);
-                                            }
-                                        } catch (Exception e) {
-                                            log.debug("Could not check bank for item " + itemId + ": " + e.getMessage());
-                                            return false;
-                                        }
-                                    });
-
-                            if (hasAnyAlternative) {
-                                // Find the first available alternative in bank and add it to our map
-                                alternativeItems.stream()
-                                        .filter(itemId -> {
-                                            try {
-                                                if (isCurrencyBasedTransport(transport.getType()) && transport.getCurrencyAmount() > 0) {
-                                                    // For currency-based transports, check if we have enough currency
-                                                    return Rs2Bank.count(itemId) >= transport.getCurrencyAmount();
-                                                } else {
-                                                    // For regular items, just check if we have the item
-                                                    return Rs2Bank.hasItem(itemId);
-                                                }
-                                            } catch (Exception e) {
-                                                log.debug("Could not check bank for item " + itemId + ": " + e.getMessage());
-                                                return false;
-                                            }
-                                        })
-                                        .findFirst()
-                                        .ifPresent(itemId -> {
-                                            // Determine required quantity based on transport type
-                                            int requiredQuantity;
-                                            if (isCurrencyBasedTransport(transport.getType()) && transport.getCurrencyAmount() > 0) {
-                                                // For currency-based transports, use the actual currency amount
-                                                requiredQuantity = transport.getCurrencyAmount();
-                                                log.debug("Currency-based transport {} requires {} x{}",
-                                                        transport.getType(), transport.getCurrencyName(), requiredQuantity);
-                                            } else {
-                                                // For regular items (teleportation items, fairy rings, etc.), assume 1 is needed
-                                                requiredQuantity = 1;
-                                            }
-
-                                            int currentQuantity = itemQuantityMap.getOrDefault(itemId, 0);
-                                            itemQuantityMap.put(itemId, currentQuantity + requiredQuantity);
-                                        });
-                                break; // Only need one item from this alternative set
-                            }
-                        }
-                    }
-                });
+                    break;
+                }
+            }
+        }
 
         return itemQuantityMap;
+    }
+
+    /**
+     * Checks whether a specific item is available in the bank in sufficient quantity.
+     */
+    private static boolean isItemAvailableInBank(int itemId, TransportType transportType, int currencyAmount) {
+        try {
+            if (isCurrencyBasedTransport(transportType) && currencyAmount > 0) {
+                return Rs2Bank.count(itemId) >= currencyAmount;
+            } else {
+                return Rs2Bank.hasItem(itemId);
+            }
+        } catch (Exception e) {
+            log.debug("Could not check bank for item {}: {}", itemId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Determines the required quantity of an item for a transport.
+     */
+    private static int getRequiredQuantity(Transport transport) {
+        if (isCurrencyBasedTransport(transport.getType()) && transport.getCurrencyAmount() > 0) {
+            log.debug("Currency-based transport {} requires {} x{}",
+                    transport.getType(), transport.getCurrencyName(), transport.getCurrencyAmount());
+            return transport.getCurrencyAmount();
+        }
+        return 1;
+    }
+
+    /**
+     * Collects spell rune requirements for a teleportation spell transport and adds
+     * them to the item quantity map if available in the bank.
+     */
+    private static void collectSpellRuneRequirements(Transport transport, Map<Integer, Integer> itemQuantityMap) {
+        Map<Integer, Integer> spellRuneRequirements = getSpellRuneRequirements(transport);
+        for (Map.Entry<Integer, Integer> entry : spellRuneRequirements.entrySet()) {
+            int runeItemId = entry.getKey();
+            int requiredQuantity = entry.getValue();
+            try {
+                int bankQuantity = Rs2Bank.count(runeItemId);
+                if (bankQuantity >= requiredQuantity) {
+                    int currentQuantity = itemQuantityMap.getOrDefault(runeItemId, 0);
+                    itemQuantityMap.put(runeItemId, currentQuantity + requiredQuantity);
+                    log.debug("Added teleportation spell rune requirement: {} x{} (bank has: {})",
+                            runeItemId, requiredQuantity, bankQuantity);
+                }
+            } catch (Exception e) {
+                log.debug("Could not check bank for rune {}: {}", runeItemId, e.getMessage());
+            }
+        }
     }
 
     /**
