@@ -170,224 +170,290 @@ public class Rs2Walker {
      * @param target
      * @param distance
      */
+    private static final int MAX_WALK_ITERATIONS = 100;
+
+    /**
+     * Core walk method. Iteratively walks the path, handling doors, transports,
+     * and obstacles until the target is reached or retries are exhausted.
+     */
     private static WalkerState processWalk(WorldPoint target, int distance) {
         if (debug) {
             return WalkerState.EXIT;
         }
-        try {
-            if (!Microbot.isLoggedIn()) {
+
+        for (int iteration = 0; iteration < MAX_WALK_ITERATIONS; iteration++) {
+            try {
+                if (!Microbot.isLoggedIn()) {
+                    setTarget(null);
+                    return WalkerState.EXIT;
+                }
+
+                Pathfinder pathfinder = awaitPathfinder();
+                if (pathfinder == null) {
+                    return WalkerState.EXIT;
+                }
+
+                List<WorldPoint> path = pathfinder.getPath();
+                WalkerState validationResult = validatePath(path, target, distance);
+                if (validationResult != null) {
+                    return validationResult;
+                }
+
+                if (isNear(path.get(path.size() - 1))) {
+                    setTarget(null);
+                }
+
+                handleStuckDetection();
+
+                int indexOfStartPoint = getClosestTileIndex(path);
+                if (indexOfStartPoint == -1) {
+                    setTarget(null);
+                    return WalkerState.EXIT;
+                }
+
+                lastPosition = Rs2Player.getWorldLocation();
+
+                if (Rs2Player.getWorldLocation().distanceTo(target) == 0 || path.size() <= 1) {
+                    setTarget(null);
+                    return WalkerState.ARRIVED;
+                }
+
+                handleWarningDialogues();
+                boolean handledObstacle = walkAlongPath(path, indexOfStartPoint, target, distance);
+                walkToFinalTile(handledObstacle, path, distance);
+
+                int finalDist = Rs2Player.getWorldLocation().distanceTo(target);
+                if (finalDist < distance) {
+                    setTarget(null);
+                    return WalkerState.ARRIVED;
+                }
+                // Not arrived yet — loop will retry
+            } catch (InterruptedException ex) {
+                log.info("Pathfinder was interrupted, exiting");
+                setTarget(null);
+                return WalkerState.EXIT;
+            } catch (Exception ex) {
+                log.error("Exception in Rs2Walker:", ex);
+            }
+        }
+
+        log.warn("Walker exceeded maximum iterations ({}), exiting", MAX_WALK_ITERATIONS);
+        setTarget(null);
+        return WalkerState.EXIT;
+    }
+
+    /**
+     * Waits for the pathfinder to be initialized and complete its calculation.
+     * @return the completed Pathfinder, or null if unavailable or timed out
+     */
+    private static Pathfinder awaitPathfinder() {
+        Pathfinder pathfinder = ShortestPathPlugin.getPathfinder();
+        if (pathfinder == null) {
+            if (ShortestPathPlugin.getMarker() == null) {
                 setTarget(null);
             }
-
-            Pathfinder pathfinder = ShortestPathPlugin.getPathfinder();
+            pathfinder = sleepUntilNotNull(ShortestPathPlugin::getPathfinder, 2_000);
             if (pathfinder == null) {
-                if (ShortestPathPlugin.getMarker() == null) {
-                    setTarget(null);
-                }
-                pathfinder = sleepUntilNotNull(ShortestPathPlugin::getPathfinder, 2_000);
-                if (pathfinder == null) {
-                    setTarget(null);
-                    return WalkerState.EXIT;
-                }
+                setTarget(null);
+                return null;
             }
+        }
 
-            if (!pathfinder.isDone()) {
-                boolean isDone = sleepUntilTrue(pathfinder::isDone, 100, 10_000);
-                if (!isDone) {
-                    setTarget(null);
-                    return WalkerState.EXIT;
-                }
+        if (!pathfinder.isDone()) {
+            boolean isDone = sleepUntilTrue(pathfinder::isDone, 100, 10_000);
+            if (!isDone) {
+                setTarget(null);
+                return null;
+            }
+        }
+
+        if (ShortestPathPlugin.getMarker() == null) {
+            setTarget(null);
+            return null;
+        }
+
+        return pathfinder;
+    }
+
+    /**
+     * Validates that the pathfinder produced a usable path to the target.
+     * @return a terminal WalkerState if the path is invalid, or null if the path is valid and walking should proceed
+     */
+    private static WalkerState validatePath(List<WorldPoint> path, WorldPoint target, int distance) {
+        WorldPoint dst;
+        if (path == null || path.isEmpty()) {
+            dst = Rs2Player.getWorldLocation();
+        } else {
+            dst = path.get(path.size() - 1);
+        }
+
+        if (dst == null || dst.distanceTo(target) > distance) {
+            setTarget(null);
+            return WalkerState.UNREACHABLE;
+        }
+
+        if (path == null || path.isEmpty()) {
+            return WalkerState.ARRIVED;
+        }
+
+        return null;
+    }
+
+    /**
+     * Detects if the player is stuck and attempts to move to a random nearby tile.
+     */
+    private static void handleStuckDetection() {
+        checkIfStuck();
+        if (stuckCount > 10) {
+            var moveableTiles = Rs2Tile.getReachableTilesFromTile(Rs2Player.getWorldLocation(), 5).keySet().toArray(new WorldPoint[0]);
+            if (moveableTiles.length > 0) {
+                walkMiniMap(moveableTiles[Rs2Random.between(0, moveableTiles.length)]);
+                sleepGaussian(1000, 300);
+                stuckCount = 0;
+            }
+        }
+    }
+
+    /**
+     * Dismisses any blocking warning dialogues encountered during walking
+     * (wilderness lever, desert entry, stronghold of security, wilderness entry).
+     */
+    private static void handleWarningDialogues() {
+        // Edgeville/ardy wilderness lever warning
+        if (Rs2Widget.isWidgetVisible(229, 1)) {
+            String dialogueText = Rs2Dialogue.getDialogueText();
+            if (dialogueText != null && dialogueText.equalsIgnoreCase("Warning! The lever will teleport you deep into the Wilderness.")) {
+                log.info("Detected Wilderness lever warning, interacting...");
+                Rs2Dialogue.clickContinue();
+                Rs2Dialogue.sleepUntilHasQuestion("Are you sure you wish to pull it?");
+                Rs2Dialogue.clickOption("Yes, I'm brave.");
+                sleep(1200, 2400);
+            }
+        }
+
+        // Entering desert warning
+        if (Rs2Widget.clickWidget(565, 20)) {
+            sleepUntil(() -> {
+                Widget checkBoxWidget = Rs2Widget.getWidget(565, 20);
+                if (checkBoxWidget == null) return false;
+                return checkBoxWidget.getSpriteId() != 941;
+            });
+            Rs2Widget.clickWidget(565, 17);
+        }
+
+        // Entering down ladder stronghold of security
+        if (Rs2Widget.clickWidget(579, 20)) {
+            sleepUntil(() -> {
+                Widget checkBoxWidget = Rs2Widget.getWidget(579, 20);
+                if (checkBoxWidget == null) return false;
+                return checkBoxWidget.getSpriteId() != 941;
+            });
+            Rs2Widget.clickWidget(579, 17);
+        }
+
+        if (Rs2Widget.enterWilderness()) {
+            sleepUntil(Rs2Player::isAnimating);
+        }
+    }
+
+    /**
+     * Iterates along the path from the start index, handling doors, rockfalls,
+     * transports, and minimap walking for each tile.
+     * @return true if a door, rockfall, or transport was handled (path interrupted)
+     */
+    private static boolean walkAlongPath(List<WorldPoint> path, int indexOfStartPoint, WorldPoint target, int distance) {
+        for (int i = indexOfStartPoint; i < path.size(); i++) {
+            WorldPoint currentWorldPoint = path.get(i);
+            if (config.drawDebugPanel()) {
+                WorldPoint nextWorldPoint = i + 1 < path.size() ? path.get(i + 1) : null;
+                log.debug("start loop {}, from={}, to={}", i, currentWorldPoint, nextWorldPoint);
             }
 
             if (ShortestPathPlugin.getMarker() == null) {
-                setTarget(null);
-                return WalkerState.EXIT;
+                log.debug("Marker is null, breaking path iteration");
+                break;
             }
 
-            final List<WorldPoint> path = pathfinder.getPath();
-            final WorldPoint dst;
-            if (path == null || path.isEmpty()) {
-                dst = Rs2Player.getWorldLocation();
-            } else {
-                dst = path.get(path.size()-1);
+            if (!isNearPath()) {
+                log.info("No longer near path");
+                if (config.cancelInstead()) {
+                    log.info("Cancel instead of recalculate");
+                    setTarget(null);
+                } else {
+                    recalculatePath();
+                }
+                break;
             }
 
-            if (dst == null || dst.distanceTo(target) > distance) {
-                setTarget(null);
-                return WalkerState.UNREACHABLE;
+            if (handleDoors(path, i)) {
+                log.debug("Break out of path loop: door handled");
+                return true;
             }
 
-            if (path == null || path.isEmpty()) {
-                return WalkerState.ARRIVED;
+            if (handleRockfall(path, i)) {
+                log.debug("Break out of path loop: rockfall handled");
+                return true;
             }
 
-            boolean nearDst = isNear(dst);
-            if (nearDst) {
-                setTarget(null);
-            }
-
-            checkIfStuck();
-            if (stuckCount > 10) {
-                var moveableTiles = Rs2Tile.getReachableTilesFromTile(Rs2Player.getWorldLocation(), 5).keySet().toArray(new WorldPoint[0]);
-                if (moveableTiles.length > 0) {
-                    walkMiniMap(moveableTiles[Rs2Random.between(0, moveableTiles.length)]);
-                    sleepGaussian(1000, 300);
-                    stuckCount = 0;
+            boolean inInstance = Microbot.getClient().getTopLevelWorldView().isInstance();
+            if (PohTeleports.isInHouse() || !inInstance) {
+                if (handleTransports(path, i)) {
+                    log.debug("Break out of path loop: transport handled");
+                    return true;
                 }
             }
 
-            int indexOfStartPoint = getClosestTileIndex(path);
-            if (indexOfStartPoint == -1) {
-                setTarget(null);
-                return WalkerState.EXIT;
+            if (!Rs2Tile.isTileReachable(currentWorldPoint) && !inInstance) {
+                continue;
             }
 
-            lastPosition = Rs2Player.getWorldLocation();
-
-            if (Rs2Player.getWorldLocation().distanceTo(target) == 0 || path.size() <= 1) {
-                setTarget(null);
-                return WalkerState.ARRIVED;
+            nextWalkingDistance = Rs2Random.between(7, 11);
+            int dist2d = currentWorldPoint.distanceTo2D(Rs2Player.getWorldLocation());
+            if (dist2d > nextWalkingDistance) {
+                walkToTile(currentWorldPoint, inInstance);
             }
-
-            // Edgeville/ardy wilderness lever warning
-            if (Rs2Widget.isWidgetVisible(229, 1)) {
-                if (Rs2Dialogue.getDialogueText().equalsIgnoreCase("Warning! The lever will teleport you deep into the Wilderness.")) {
-                    log.info("Detected Wilderness lever warning, interacting...");
-                    Rs2Dialogue.clickContinue();
-                    Rs2Dialogue.sleepUntilHasQuestion("Are you sure you wish to pull it?");
-                    Rs2Dialogue.clickOption("Yes, I'm brave.");
-                    sleep(1200, 2400);
-                }
-            }
-
-            // entering desert warning
-            if (Rs2Widget.clickWidget(565, 20)) {
-                sleepUntil(() -> {
-                    Widget checkBoxWidget = Rs2Widget.getWidget(565, 20);
-                    if (checkBoxWidget == null) return false;
-                    return checkBoxWidget.getSpriteId() != 941;
-                });
-                Rs2Widget.clickWidget(565, 17);
-            }
-
-            // entering down ladder strong hold of security
-            if (Rs2Widget.clickWidget(579, 20)) {
-                sleepUntil(() -> {
-                    Widget checkBoxWidget = Rs2Widget.getWidget(579, 20);
-                    if (checkBoxWidget == null) return false;
-                    return checkBoxWidget.getSpriteId() != 941;
-                });
-                Rs2Widget.clickWidget(579, 17);
-            }
-
-
-            if (Rs2Widget.enterWilderness()) {
-                sleepUntil(Rs2Player::isAnimating);
-            }
-
-            boolean doorOrTransportResult = false;
-            for (int i = indexOfStartPoint; i < path.size(); i++) {
-                WorldPoint currentWorldPoint = path.get(i);
-                WorldPoint nextWorldPoint = i + 1 < path.size() ? path.get(i + 1) : null;
-                if (config.drawDebugPanel()) {
-                    System.out.printf("start loop %s, from=%s, to=%s\n", i, currentWorldPoint, nextWorldPoint);
-                }
-
-				// add breakpoint here
-
-                if (ShortestPathPlugin.getMarker() == null) {
-                    System.out.println("marker is null");
-                    break;
-                }
-
-                if (!isNearPath()) {
-                    System.out.println("No longer near path");
-                    if (config.cancelInstead()) {
-                        System.out.println("cancel instead of recalculate");
-                        setTarget(null);
-                    } else {
-                        recalculatePath();
-                    }
-                    break;
-                }
-
-                doorOrTransportResult = handleDoors(path, i);
-                if (doorOrTransportResult) {
-                    System.out.println("break out of door");
-                    break;
-                }
-
-                doorOrTransportResult = handleRockfall(path, i);
-                if (doorOrTransportResult) {
-                    System.out.println("break out of rockfall");
-                    break;
-                }
-
-                //Again, would be nice to have access to current node, since we're going to have to handle transports in instance (PoH)
-                boolean inInstance = Microbot.getClient().getTopLevelWorldView().isInstance();
-                if (PohTeleports.isInHouse() || !inInstance) {
-                    doorOrTransportResult = handleTransports(path, i);
-                }
-
-                if (doorOrTransportResult) {
-                    System.out.println("break out of transport");
-                    break;
-                }
-
-                boolean tileReachable = Rs2Tile.isTileReachable(currentWorldPoint);
-                if (!tileReachable && !inInstance) {
-                    continue;
-                }
-                nextWalkingDistance = Rs2Random.between(7, 11);
-                int dist2d = currentWorldPoint.distanceTo2D(Rs2Player.getWorldLocation());
-                if (dist2d > nextWalkingDistance) {
-                    if (Microbot.getClient().getTopLevelWorldView().isInstance()) {
-                        if (Rs2Walker.walkMiniMap(currentWorldPoint)) {
-                            final WorldPoint b = currentWorldPoint;
-                            sleepUntil(() -> b.distanceTo2D(Rs2Player.getWorldLocation()) < nextWalkingDistance, 2000);
-                        }
-                    } else {
-                        if (currentWorldPoint.distanceTo2D(Rs2Player.getWorldLocation()) > nextWalkingDistance) {
-                            if (Rs2Walker.walkMiniMap(getPointWithWallDistance(currentWorldPoint))) {
-                                final WorldPoint b = currentWorldPoint;
-                                sleepUntil(() -> b.distanceTo2D(Rs2Player.getWorldLocation()) < nextWalkingDistance, 2000);
-                            }
-                        }
-                    }
-                }
-            }
-
-
-            if (!doorOrTransportResult) {
-                if (!path.isEmpty()) {
-                    var moveableTiles = Rs2Tile.getReachableTilesFromTile(path.get(path.size() - 1), Math.min(3, distance)).keySet().toArray(new WorldPoint[0]);
-                    var finalTile = (config.randomizeFinalTile() && moveableTiles.length > 0) ? moveableTiles[Rs2Random.between(0, moveableTiles.length)] : path.get(path.size() - 1);
-
-                    if (Rs2Tile.isTileReachable(finalTile)) {
-                        if (Rs2Walker.walkFastCanvas(finalTile)) {
-                            sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(finalTile) < 2, 3000);
-                        }
-                    }
-
-                }
-            }
-            int finalDist = Rs2Player.getWorldLocation().distanceTo(target);
-            if (finalDist < distance) {
-                setTarget(null);
-                return WalkerState.ARRIVED;
-            } else {
-                return processWalk(target, distance);
-            }
-        } catch (Exception ex) {
-            if (ex instanceof InterruptedException) {
-                log.info("Pathfinder was interrupted, exiting: 397");
-                setTarget(null);
-                return WalkerState.EXIT;
-            }
-            log.error("Exception in Rs2Walker:", ex);
         }
-        log.info("Exiting walker: 403");
-        return WalkerState.EXIT;
+        return false;
+    }
+
+    /**
+     * Walks toward a tile on the path using the minimap, handling instanced vs normal worlds.
+     */
+    private static void walkToTile(WorldPoint tile, boolean inInstance) {
+        if (inInstance) {
+            if (Rs2Walker.walkMiniMap(tile)) {
+                final WorldPoint target = tile;
+                sleepUntil(() -> target.distanceTo2D(Rs2Player.getWorldLocation()) < nextWalkingDistance, 2000);
+            }
+        } else {
+            if (tile.distanceTo2D(Rs2Player.getWorldLocation()) > nextWalkingDistance) {
+                if (Rs2Walker.walkMiniMap(getPointWithWallDistance(tile))) {
+                    final WorldPoint target = tile;
+                    sleepUntil(() -> target.distanceTo2D(Rs2Player.getWorldLocation()) < nextWalkingDistance, 2000);
+                }
+            }
+        }
+    }
+
+    /**
+     * Attempts to walk to the final tile of the path using canvas clicking,
+     * optionally randomizing the final tile position.
+     */
+    private static void walkToFinalTile(boolean handledObstacle, List<WorldPoint> path, int distance) {
+        if (handledObstacle || path.isEmpty()) {
+            return;
+        }
+
+        var moveableTiles = Rs2Tile.getReachableTilesFromTile(path.get(path.size() - 1), Math.min(3, distance)).keySet().toArray(new WorldPoint[0]);
+        var finalTile = (config.randomizeFinalTile() && moveableTiles.length > 0)
+                ? moveableTiles[Rs2Random.between(0, moveableTiles.length)]
+                : path.get(path.size() - 1);
+
+        if (Rs2Tile.isTileReachable(finalTile)) {
+            if (Rs2Walker.walkFastCanvas(finalTile)) {
+                sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(finalTile) < 2, 3000);
+            }
+        }
     }
 
     public static boolean walkNextTo(GameObject target) {
@@ -1052,7 +1118,7 @@ public class Rs2Walker {
                 : rawTo;
 
         if (isInstance && (toWp == null || fromWp == null)) {
-            System.out.println("HandleDoor: isInstance=true fromWp=" + fromWp + ", toWp=" + toWp);
+            log.debug("HandleDoor: isInstance=true fromWp={}, toWp={}", fromWp, toWp);
             //This happens when we're inside the PoH and the next tile is the teleport destination
             //Rs2WorldPoint.convertInstancedWorldPoint(rawTo) -> LocalPoint l = Rs2LocalPoint.fromWorldInstance(worldPoint) returns null
             return false;
@@ -1415,212 +1481,280 @@ public class Rs2Walker {
     private static boolean handleTransports(List<WorldPoint> path, int indexOfStartPoint) {
         Set<Transport> transports = ShortestPathPlugin.getTransports().getOrDefault(path.get(indexOfStartPoint), new HashSet<>());
         log.debug("Found transports: {}", transports.stream().map(Transport::getDisplayInfo).collect(Collectors.joining(", ")));
+
         for (Transport transport : transports) {
-            Collection<WorldPoint> worldPointCollections;
-            //in some cases the getOrigin is null, for teleports that start the player location
+            Collection<WorldPoint> originPoints;
             if (transport.getOrigin() == null) {
-                worldPointCollections = Collections.singleton(null);
+                originPoints = Collections.singleton(null);
             } else {
-                worldPointCollections = WorldPoint.toLocalInstance(Microbot.getClient().getTopLevelWorldView(), transport.getOrigin());
+                originPoints = WorldPoint.toLocalInstance(Microbot.getClient().getTopLevelWorldView(), transport.getOrigin());
             }
             log.debug("Considering transport: {}", transport.getDisplayInfo());
-            for (WorldPoint origin : worldPointCollections) {
+
+            for (WorldPoint origin : originPoints) {
                 if (transport.getOrigin() != null && Rs2Player.getWorldLocation().getPlane() != transport.getOrigin().getPlane()) {
                     continue;
                 }
 
                 for (int i = indexOfStartPoint; i < path.size(); i++) {
-                    if (origin != null && origin.getPlane() != Rs2Player.getWorldLocation().getPlane())
+                    if (!isTransportApplicable(transport, path, origin)) {
                         continue;
-                    if (path.stream().noneMatch(x -> x.equals(transport.getDestination()))) continue;
-                    if (TransportType.isTeleport(transport.getType()) && Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 3) continue;
-
-                    // we don't need to check for teleportation_item & teleportation_spell as they will be set on the first tile
-                    if (!TransportType.isTeleport(transport.getType())) {
-                        int indexOfOrigin = IntStream.range(0, path.size())
-                                .filter(f -> path.get(f).equals(transport.getOrigin()))
-                                .findFirst()
-                                .orElse(-1);
-                        int indexOfDestination = IntStream.range(0, path.size())
-                                .filter(f -> path.get(f).equals(transport.getDestination()))
-                                .findFirst()
-                                .orElse(-1);
-                        if (indexOfDestination == -1) continue;
-                        if (indexOfOrigin == -1) continue;
-                        if (indexOfDestination < indexOfOrigin) continue;
                     }
 
+                    // Origin-matched transports: NPC-based and charter ships
                     if (path.get(i).equals(origin)) {
-                        if (transport.getType() == TransportType.SHIP || transport.getType() == TransportType.NPC || transport.getType() == TransportType.BOAT) {
-
-                            Rs2NpcModel npc = Rs2Npc.getNpc(transport.getName());
-
-                            if (Rs2Npc.canWalkTo(npc, 20) && Rs2Npc.interact(npc, transport.getAction())) {
-                                Rs2Player.waitForWalking();
-                                sleepUntil(Rs2Dialogue::isInDialogue,600*2);
-
-                                if (Objects.equals(transport.getName(), "Veos") && Objects.equals(transport.getAction(), "Talk-to")) {
-                                    sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
-                                    Rs2Dialogue.clickOption("Can you take me somewhere?");
-                                    sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
-                                    Rs2Dialogue.clickOption(transport.getDisplayInfo());
-                                    sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
-                                }
-
-                                if (Objects.equals(transport.getName(), "Captain Magoro") && Objects.equals(transport.getAction(), "Talk-to")) {
-                                    sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
-                                    Rs2Dialogue.clickOption(transport.getDisplayInfo());
-                                    sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
-                                }
-
-                                if (Rs2Dialogue.clickOption("I'm just going to Pirates' cove")){
-                                    sleep(600 * 2);
-                                    Rs2Dialogue.clickContinue();
-                                } else if (Objects.equals(transport.getName(), "Mountain Guide")) {
-                                    Rs2Dialogue.clickOption(transport.getDisplayInfo());
-                                }
-                                sleepUntil(() -> !Rs2Player.isAnimating());
-                                sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
-                                sleep(600 * 6);
-                            } else {
-                                Rs2Walker.walkFastCanvas(path.get(i));
-                                sleep(1200, 1600);
-                            }
-                        }
-
-                        if (transport.getType() == TransportType.CHARTER_SHIP) {
-                            if (handleCharterShip(transport)) {
-                                sleepUntil(() -> !Rs2Player.isAnimating());
-                                sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
-                                sleep(600 * 4); // wait 4 extra ticks before walking
-                                break;
-                            }
+                        if (handleOriginMatchedTransport(transport, path, i)) {
+                            return true;
                         }
                     }
 
+                    // Type-dispatched transports (not origin-dependent)
                     log.debug("Handling {} transport: {}", transport.getType(), transport.getDisplayInfo());
-                    if (transport.getType() == TransportType.POH) {
-                        if (handlePohTransport(transport)) {
-                            sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET, 10000);
-                            break;
-                        }
+                    boolean handled = dispatchTransportByType(transport);
+                    if (handled) {
+                        return true;
                     }
 
-                    if (transport.getType() == TransportType.CANOE) {
-                        if (handleCanoe(transport)) {
-                            sleep(600 * 2); // wait 2 extra ticks before walking
-                            break;
-                        }
+                    // Fallback: generic object-based transport
+                    if (handleGenericObjectTransport(transport)) {
+                        return true;
                     }
 
-                    if (transport.getType() == TransportType.SPIRIT_TREE) {
-                        if (handleSpiritTree(transport)) {
-                            sleepUntil(() -> !Rs2Player.isAnimating());
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.QUETZAL) {
-                        if (handleQuetzal(transport)) {
-                            sleep(600 * 2); // wait 2 extra ticks before walking
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.MAGIC_CARPET) {
-                        if (handleMagicCarpet(transport)) {
-                            sleep(600 * 2); // wait 2 extra ticks before walking
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.WILDERNESS_OBELISK) {
-                        if (handleWildernessObelisk(transport)) {
-                            sleep(600 * 2);
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.GNOME_GLIDER) {
-                        if (handleGlider(transport)) {
-                            sleepUntil(() -> !Rs2Player.isAnimating());
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
-                            sleep(600 * 3); // wait 3 extra ticks before walking
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.FAIRY_RING && !Rs2Player.getWorldLocation().equals(transport.getDestination())) {
-                        if (handleFairyRing(transport)) {
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.TELEPORTATION_MINIGAME) {
-                        if (handleMinigameTeleport(transport)) {
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < (OFFSET * 2));
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.TELEPORTATION_ITEM) {
-                        if (handleTeleportItem(transport)) {
-                            sleepUntil(() -> !Rs2Player.isAnimating());
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.TELEPORTATION_SPELL) {
-                        if (handleTeleportSpell(transport)) {
-                            sleepUntil(() -> !Rs2Player.isAnimating());
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
-                            Rs2Tab.switchTo(InterfaceTab.INVENTORY);
-                            break;
-                        }
-                    }
-
-                    if (transport.getObjectId() <= 0) break;
-
-                    // Use class-level constants for object ID mapping
-                    List<Integer> objectIdsToSearch = new ArrayList<>();
-                    objectIdsToSearch.add(transport.getObjectId());
-
-                    // If this transport is for an open trapdoor, also search for the closed version
-                    if (OPEN_TO_CLOSED_MAPPINGS.containsKey(transport.getObjectId())) {
-                        objectIdsToSearch.add(OPEN_TO_CLOSED_MAPPINGS.get(transport.getObjectId()));
-                    }
-
-                    List<TileObject> objects = Rs2GameObject.getAll(o -> objectIdsToSearch.contains(o.getId()), transport.getOrigin(), 10).stream()
-                            .sorted(Comparator.comparingInt(o -> o.getWorldLocation().distanceTo(transport.getOrigin())))
-                            .collect(Collectors.toList());
-
-                    TileObject object = objects.stream().findFirst().orElse(null);
-                    if (object instanceof GroundObject) {
-                        object = objects.stream()
-                                .filter(o -> !Objects.equals(o.getWorldLocation(), Rs2Player.getWorldLocation()))
-                                .min(Comparator.comparing(o -> ((TileObject) o).getWorldLocation().distanceTo(transport.getOrigin()))
-                                        .thenComparing(o -> ((TileObject) o).getWorldLocation().distanceTo(transport.getDestination()))).orElse(null);
-                    }
-
-                    if (object != null) {
-                        // Skip reachability check for GroundObjects and Magic Mushtrees
-                        if (!(object instanceof GroundObject) && !MagicMushtree.isMagicMushtree(transport.getObjectId())) {
-                            if (!Rs2Tile.isTileReachable(transport.getOrigin())) {
-                                break;
-                            }
-                        }
-
-                        handleObject(transport, object);
-                        sleepUntil(() -> !Rs2Player.isAnimating());
-                        return sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
-                    }
+                    break;
                 }
             }
         }
         return false;
+    }
+
+    /**
+     * Checks whether a transport is applicable at the current path position.
+     */
+    private static boolean isTransportApplicable(Transport transport, List<WorldPoint> path, WorldPoint origin) {
+        if (origin != null && origin.getPlane() != Rs2Player.getWorldLocation().getPlane()) {
+            return false;
+        }
+        if (path.stream().noneMatch(x -> x.equals(transport.getDestination()))) {
+            return false;
+        }
+        if (TransportType.isTeleport(transport.getType()) && Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 3) {
+            return false;
+        }
+        if (!TransportType.isTeleport(transport.getType())) {
+            int indexOfOrigin = IntStream.range(0, path.size())
+                    .filter(f -> path.get(f).equals(transport.getOrigin()))
+                    .findFirst().orElse(-1);
+            int indexOfDestination = IntStream.range(0, path.size())
+                    .filter(f -> path.get(f).equals(transport.getDestination()))
+                    .findFirst().orElse(-1);
+            if (indexOfDestination == -1 || indexOfOrigin == -1 || indexOfDestination < indexOfOrigin) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Handles transports that require the player to be at the origin tile:
+     * NPC-based transports (ships, boats, NPCs) and charter ships.
+     * @return true if the transport was handled
+     */
+    private static boolean handleOriginMatchedTransport(Transport transport, List<WorldPoint> path, int pathIndex) {
+        TransportType type = transport.getType();
+
+        if (type == TransportType.SHIP || type == TransportType.NPC || type == TransportType.BOAT) {
+            return handleNpcTransport(transport, path, pathIndex);
+        }
+
+        if (type == TransportType.CHARTER_SHIP) {
+            if (handleCharterShip(transport)) {
+                sleepUntil(() -> !Rs2Player.isAnimating());
+                sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
+                sleep(600 * 4);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Handles NPC-based transports (ships, boats, NPCs) including special dialogue
+     * handling for specific NPCs like Veos, Captain Magoro, and Mountain Guide.
+     */
+    private static boolean handleNpcTransport(Transport transport, List<WorldPoint> path, int pathIndex) {
+        Rs2NpcModel npc = Rs2Npc.getNpc(transport.getName());
+
+        if (!Rs2Npc.canWalkTo(npc, 20) || !Rs2Npc.interact(npc, transport.getAction())) {
+            Rs2Walker.walkFastCanvas(path.get(pathIndex));
+            sleep(1200, 1600);
+            return false;
+        }
+
+        Rs2Player.waitForWalking();
+        sleepUntil(Rs2Dialogue::isInDialogue, 600 * 2);
+
+        if (Objects.equals(transport.getName(), "Veos") && Objects.equals(transport.getAction(), "Talk-to")) {
+            sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+            Rs2Dialogue.clickOption("Can you take me somewhere?");
+            sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+            Rs2Dialogue.clickOption(transport.getDisplayInfo());
+            sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+        }
+
+        if (Objects.equals(transport.getName(), "Captain Magoro") && Objects.equals(transport.getAction(), "Talk-to")) {
+            sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+            Rs2Dialogue.clickOption(transport.getDisplayInfo());
+            sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+        }
+
+        if (Rs2Dialogue.clickOption("I'm just going to Pirates' cove")) {
+            sleep(600 * 2);
+            Rs2Dialogue.clickContinue();
+        } else if (Objects.equals(transport.getName(), "Mountain Guide")) {
+            Rs2Dialogue.clickOption(transport.getDisplayInfo());
+        }
+
+        sleepUntil(() -> !Rs2Player.isAnimating());
+        sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
+        sleep(600 * 6);
+        return true;
+    }
+
+    /**
+     * Dispatches transport handling based on transport type.
+     * @return true if the transport was successfully handled
+     */
+    private static boolean dispatchTransportByType(Transport transport) {
+        switch (transport.getType()) {
+            case POH:
+                if (handlePohTransport(transport)) {
+                    sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET, 10000);
+                    return true;
+                }
+                return false;
+
+            case CANOE:
+                if (handleCanoe(transport)) {
+                    sleep(600 * 2);
+                    return true;
+                }
+                return false;
+
+            case SPIRIT_TREE:
+                if (handleSpiritTree(transport)) {
+                    sleepUntil(() -> !Rs2Player.isAnimating());
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
+                    return true;
+                }
+                return false;
+
+            case QUETZAL:
+                if (handleQuetzal(transport)) {
+                    sleep(600 * 2);
+                    return true;
+                }
+                return false;
+
+            case MAGIC_CARPET:
+                if (handleMagicCarpet(transport)) {
+                    sleep(600 * 2);
+                    return true;
+                }
+                return false;
+
+            case WILDERNESS_OBELISK:
+                if (handleWildernessObelisk(transport)) {
+                    sleep(600 * 2);
+                    return true;
+                }
+                return false;
+
+            case GNOME_GLIDER:
+                if (handleGlider(transport)) {
+                    sleepUntil(() -> !Rs2Player.isAnimating());
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
+                    sleep(600 * 3);
+                    return true;
+                }
+                return false;
+
+            case FAIRY_RING:
+                if (!Rs2Player.getWorldLocation().equals(transport.getDestination()) && handleFairyRing(transport)) {
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
+                    return true;
+                }
+                return false;
+
+            case TELEPORTATION_MINIGAME:
+                if (handleMinigameTeleport(transport)) {
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < (OFFSET * 2));
+                    return true;
+                }
+                return false;
+
+            case TELEPORTATION_ITEM:
+                if (handleTeleportItem(transport)) {
+                    sleepUntil(() -> !Rs2Player.isAnimating());
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
+                    return true;
+                }
+                return false;
+
+            case TELEPORTATION_SPELL:
+                if (handleTeleportSpell(transport)) {
+                    sleepUntil(() -> !Rs2Player.isAnimating());
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
+                    Rs2Tab.switchTo(InterfaceTab.INVENTORY);
+                    return true;
+                }
+                return false;
+
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Handles transports backed by game objects (trapdoors, ladders, shortcuts, etc).
+     * @return true if the transport was handled via an object interaction
+     */
+    private static boolean handleGenericObjectTransport(Transport transport) {
+        if (transport.getObjectId() <= 0) {
+            return false;
+        }
+
+        List<Integer> objectIdsToSearch = new ArrayList<>();
+        objectIdsToSearch.add(transport.getObjectId());
+        if (OPEN_TO_CLOSED_MAPPINGS.containsKey(transport.getObjectId())) {
+            objectIdsToSearch.add(OPEN_TO_CLOSED_MAPPINGS.get(transport.getObjectId()));
+        }
+
+        List<TileObject> objects = Rs2GameObject.getAll(o -> objectIdsToSearch.contains(o.getId()), transport.getOrigin(), 10).stream()
+                .sorted(Comparator.comparingInt(o -> o.getWorldLocation().distanceTo(transport.getOrigin())))
+                .collect(Collectors.toList());
+
+        TileObject object = objects.stream().findFirst().orElse(null);
+        if (object instanceof GroundObject) {
+            object = objects.stream()
+                    .filter(o -> !Objects.equals(o.getWorldLocation(), Rs2Player.getWorldLocation()))
+                    .min(Comparator.comparing(o -> ((TileObject) o).getWorldLocation().distanceTo(transport.getOrigin()))
+                            .thenComparing(o -> ((TileObject) o).getWorldLocation().distanceTo(transport.getDestination()))).orElse(null);
+        }
+
+        if (object == null) {
+            return false;
+        }
+
+        // Skip reachability check for GroundObjects and Magic Mushtrees
+        if (!(object instanceof GroundObject) && !MagicMushtree.isMagicMushtree(transport.getObjectId())) {
+            if (!Rs2Tile.isTileReachable(transport.getOrigin())) {
+                return false;
+            }
+        }
+
+        handleObject(transport, object);
+        sleepUntil(() -> !Rs2Player.isAnimating());
+        return sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
     }
 
     /**
@@ -2071,7 +2205,9 @@ public class Rs2Walker {
         final WorldPoint loc = Rs2Player.getWorldLocation();
         if (loc == null) return true;
 
-        if (config.recalculateDistance() < 0 || lastPosition.equals(lastPosition = loc)) {
+        boolean positionUnchanged = lastPosition != null && lastPosition.equals(loc);
+        lastPosition = loc;
+        if (config.recalculateDistance() < 0 || positionUnchanged) {
             return true;
         }
 
@@ -2948,92 +3084,88 @@ public class Rs2Walker {
 
         Map<Integer, Integer> itemQuantityMap = new HashMap<>();
 
-        transports.stream()
-                .forEach(transport -> {
-                    // Special handling for teleportation spells - use actual rune requirements
-                    if (transport.getType() == TransportType.TELEPORTATION_SPELL) {
-                        Map<Integer, Integer> spellRuneRequirements = getSpellRuneRequirements(transport);
-                        if (!spellRuneRequirements.isEmpty()) {
-                            // Check if any of the required runes are available in bank
-                            spellRuneRequirements.forEach((runeItemId, requiredQuantity) -> {
-                                try {
-                                    int bankQuantity = Rs2Bank.count(runeItemId);
-                                    if (bankQuantity >= requiredQuantity) {
-                                        int currentQuantity = itemQuantityMap.getOrDefault(runeItemId, 0);
-                                        itemQuantityMap.put(runeItemId, currentQuantity + requiredQuantity);
-                                        log.debug("Added teleportation spell rune requirement: {} (ID: {}) x{} (bank has: {})",
-                                                runeItemId, runeItemId, requiredQuantity, bankQuantity);
-                                    }
-                                } catch (Exception e) {
-                                    log.debug("Could not check bank for rune " + runeItemId + ": " + e.getMessage());
-                                }
+        for (Transport transport : transports) {
+            // Special handling for teleportation spells - use actual rune requirements
+            if (transport.getType() == TransportType.TELEPORTATION_SPELL) {
+                collectSpellRuneRequirements(transport, itemQuantityMap);
+                continue;
+            }
+
+            // Normal processing for non-spell transports
+            if (transport.getItemIdRequirements() == null) {
+                continue;
+            }
+
+            for (Set<Integer> alternativeItems : transport.getItemIdRequirements()) {
+                boolean hasAnyAlternative = alternativeItems.stream()
+                        .anyMatch(itemId -> isItemAvailableInBank(itemId, transport.getType(), transport.getCurrencyAmount()));
+
+                if (hasAnyAlternative) {
+                    alternativeItems.stream()
+                            .filter(itemId -> isItemAvailableInBank(itemId, transport.getType(), transport.getCurrencyAmount()))
+                            .findFirst()
+                            .ifPresent(itemId -> {
+                                int requiredQuantity = getRequiredQuantity(transport);
+                                int currentQuantity = itemQuantityMap.getOrDefault(itemId, 0);
+                                itemQuantityMap.put(itemId, currentQuantity + requiredQuantity);
                             });
-                        }
-                        return; // Skip normal item requirement processing for spell transports
-                    }
-
-                    // Normal processing for non-spell transports
-                    if (transport.getItemIdRequirements() != null) {
-                        for (Set<Integer> alternativeItems : transport.getItemIdRequirements()) {
-                            // For each alternative set, we need ANY one of these items
-                            // Check if we have any of the alternatives in bank
-                            boolean hasAnyAlternative = alternativeItems.stream()
-                                    .anyMatch(itemId -> {
-                                        try {
-                                            if (isCurrencyBasedTransport(transport.getType()) && transport.getCurrencyAmount() > 0) {
-                                                // For currency-based transports, check if we have enough currency
-                                                return Rs2Bank.count(itemId) >= transport.getCurrencyAmount();
-                                            } else {
-                                                // For regular items, just check if we have the item
-                                                return Rs2Bank.hasItem(itemId);
-                                            }
-                                        } catch (Exception e) {
-                                            log.debug("Could not check bank for item " + itemId + ": " + e.getMessage());
-                                            return false;
-                                        }
-                                    });
-
-                            if (hasAnyAlternative) {
-                                // Find the first available alternative in bank and add it to our map
-                                alternativeItems.stream()
-                                        .filter(itemId -> {
-                                            try {
-                                                if (isCurrencyBasedTransport(transport.getType()) && transport.getCurrencyAmount() > 0) {
-                                                    // For currency-based transports, check if we have enough currency
-                                                    return Rs2Bank.count(itemId) >= transport.getCurrencyAmount();
-                                                } else {
-                                                    // For regular items, just check if we have the item
-                                                    return Rs2Bank.hasItem(itemId);
-                                                }
-                                            } catch (Exception e) {
-                                                log.debug("Could not check bank for item " + itemId + ": " + e.getMessage());
-                                                return false;
-                                            }
-                                        })
-                                        .findFirst()
-                                        .ifPresent(itemId -> {
-                                            // Determine required quantity based on transport type
-                                            int requiredQuantity;
-                                            if (isCurrencyBasedTransport(transport.getType()) && transport.getCurrencyAmount() > 0) {
-                                                // For currency-based transports, use the actual currency amount
-                                                requiredQuantity = transport.getCurrencyAmount();
-                                                log.debug("Currency-based transport {} requires {} x{}",
-                                                        transport.getType(), transport.getCurrencyName(), requiredQuantity);
-                                            } else {
-                                                // For regular items (teleportation items, fairy rings, etc.), assume 1 is needed
-                                                requiredQuantity = 1;
-                                            }
-
-                                            int currentQuantity = itemQuantityMap.getOrDefault(itemId, 0);
-                                            itemQuantityMap.put(itemId, currentQuantity + requiredQuantity);
-                                        });
-                                break; // Only need one item from this alternative set
-                            }
-                        }
-                    }
-                });
+                    break; // Only need one item from this alternative set
+                }
+            }
+        }
 
         return itemQuantityMap;
+    }
+
+    /**
+     * Checks whether a specific item is available in the bank in sufficient quantity.
+     */
+    private static boolean isItemAvailableInBank(int itemId, TransportType transportType, int currencyAmount) {
+        try {
+            if (isCurrencyBasedTransport(transportType) && currencyAmount > 0) {
+                return Rs2Bank.count(itemId) >= currencyAmount;
+            } else {
+                return Rs2Bank.hasItem(itemId);
+            }
+        } catch (Exception e) {
+            log.debug("Could not check bank for item {}: {}", itemId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Determines the required quantity of an item for a transport.
+     */
+    private static int getRequiredQuantity(Transport transport) {
+        if (isCurrencyBasedTransport(transport.getType()) && transport.getCurrencyAmount() > 0) {
+            log.debug("Currency-based transport {} requires {} x{}",
+                    transport.getType(), transport.getCurrencyName(), transport.getCurrencyAmount());
+            return transport.getCurrencyAmount();
+        }
+        return 1;
+    }
+
+    /**
+     * Collects spell rune requirements for a teleportation spell transport and adds
+     * them to the item quantity map if available in the bank.
+     */
+    private static void collectSpellRuneRequirements(Transport transport, Map<Integer, Integer> itemQuantityMap) {
+        Map<Integer, Integer> spellRuneRequirements = getSpellRuneRequirements(transport);
+        for (Map.Entry<Integer, Integer> entry : spellRuneRequirements.entrySet()) {
+            int runeItemId = entry.getKey();
+            int requiredQuantity = entry.getValue();
+            try {
+                int bankQuantity = Rs2Bank.count(runeItemId);
+                if (bankQuantity >= requiredQuantity) {
+                    int currentQuantity = itemQuantityMap.getOrDefault(runeItemId, 0);
+                    itemQuantityMap.put(runeItemId, currentQuantity + requiredQuantity);
+                    log.debug("Added teleportation spell rune requirement: {} x{} (bank has: {})",
+                            runeItemId, requiredQuantity, bankQuantity);
+                }
+            } catch (Exception e) {
+                log.debug("Could not check bank for rune {}: {}", runeItemId, e.getMessage());
+            }
+        }
     }
 
     /**
@@ -3260,8 +3392,7 @@ public class Rs2Walker {
             double totalTimeMs = (totalEndTime - totalStartTime) / 1_000_000.0;
             performanceLog.append("ERROR after ").append(String.format("%.2f ms", totalTimeMs)).append(": ").append(e.getMessage()).append("\n");
             log.warn(performanceLog.toString());
-            log.warn("Error comparing routes to " + target + ": " + e.getMessage());
-            e.printStackTrace();
+            log.warn("Error comparing routes to {}: {}", target, e.getMessage());
             return new TransportRouteAnalysis(new ArrayList<>(), null, null,new ArrayList<>(),new ArrayList<>(), "Error calculating routes: " + e.getMessage());
         }
     }
@@ -3308,66 +3439,65 @@ public class Rs2Walker {
             log.error("Please do not call the walker from the main thread");
             return WalkerState.EXIT;
         }
-        if (Rs2Tile.getReachableTilesFromTile(Rs2Player.getWorldLocation(), distance).containsKey(target)
-                || !Rs2Tile.isWalkable(LocalPoint.fromWorld(Microbot.getClient().getTopLevelWorldView(), target)) && Rs2Player.getWorldLocation().distanceTo(target) <= distance) {
+
+        boolean reachable = Rs2Tile.getReachableTilesFromTile(Rs2Player.getWorldLocation(), distance).containsKey(target);
+        boolean unwalkableButClose = !Rs2Tile.isWalkable(LocalPoint.fromWorld(Microbot.getClient().getTopLevelWorldView(), target))
+                && Rs2Player.getWorldLocation().distanceTo(target) <= distance;
+        if (reachable || unwalkableButClose) {
             return WalkerState.ARRIVED;
         }
+
         final Pathfinder pathfinder = ShortestPathPlugin.getPathfinder();
-        if (pathfinder != null && !pathfinder.isDone())
-            return WalkerState.MOVING;
-        if ((currentTarget != null && currentTarget.equals(target)) && ShortestPathPlugin.getMarker() != null){
+        if (pathfinder != null && !pathfinder.isDone()) {
             return WalkerState.MOVING;
         }
-        Rs2Walker.currentTarget =  null;
-        // Check what transport items are needed
-        TransportRouteAnalysis comparison = compareRoutes(target);
-        List<Transport> missingTransports = getMissingTransports(getTransportsForDestination(target, true, TransportType.TELEPORTATION_SPELL));
+        if (currentTarget != null && currentTarget.equals(target) && ShortestPathPlugin.getMarker() != null) {
+            return WalkerState.MOVING;
+        }
 
+        Rs2Walker.currentTarget = null;
+
+        // Analyze routes and check for missing transport items
+        TransportRouteAnalysis comparison = compareRoutes(target);
+        List<Transport> missingTransports = getMissingTransports(
+                getTransportsForDestination(target, true, TransportType.TELEPORTATION_SPELL));
         Map<Integer, Integer> missingItemsWithQuantities = getMissingTransportItemIdsWithQuantities(missingTransports);
-        if(!missingTransports.isEmpty()){
-            log.info("\n\tFor {} transports to destination in the bank to target {} we found {} missing items",
+
+        if (!missingTransports.isEmpty()) {
+            log.info("For {} transports to target {} we found {} missing items",
                     missingTransports.size(), target, missingItemsWithQuantities.size());
         }
-        // If no missing transport items, go directly
-        if (missingItemsWithQuantities.isEmpty() && !forceBanking) {
-            log.info("\n\tNo missing transport items, traveling directly to: \n\t" + target);
-            setTarget(null); // Clear target to avoid conflicts
-            WalkerState state = walkWithStateInternal(target, distance);
-            if (state == WalkerState.ARRIVED) {
-                log.info("\n\tArrived directly at target: " + target);
-            } else {
-                log.warn("\n\tFailed to arrive directly at target: " + target + ", state: " + state);
-                setTarget(null);
-                return state;
 
+        // If no missing transport items and not forced to bank, go directly
+        if (missingItemsWithQuantities.isEmpty() && !forceBanking) {
+            log.info("No missing transport items, traveling directly to: {}", target);
+            setTarget(null);
+            WalkerState state = walkWithStateInternal(target, distance);
+            if (state != WalkerState.ARRIVED) {
+                log.warn("Failed to arrive directly at target: {}, state: {}", target, state);
+                setTarget(null);
             }
             return state;
-        } else {
-            // Compare routes if we have missing items that could be obtained from bank
-            // Use config for minimum bank route savings
-            int minBankRouteSavings = config != null ? config.minBankRouteSavings() : 0;
-            int tileSavings = comparison.getTileSavings();
-            boolean bankRouteIsBetter = !comparison.isDirectIsFaster() && tileSavings >= minBankRouteSavings;
-            // If forced banking or banking route is more efficient (with min savings), go via bank
-            if (forceBanking || bankRouteIsBetter) {
-                if (comparison.getNearestBank() != null) {
-                    log.info("\n\tUsing banking route: \n\t\tStart: {} -> Bank: {} -> Target: {}",
-                            Rs2Player.getWorldLocation(), comparison.getBankLocation(), target);
-                    // Handle the complete banking workflow using legacy walkTo approach
-                    return walkWithBankingState(comparison.getBankLocation(), missingItemsWithQuantities, target, distance);
-                } else {
-                    log.warn("\n\tBanking route requested but no accessible bank found, trying direct route");
-                    setTarget(null); // Clear target to avoid conflicts
-                    return walkWithStateInternal(target, distance);
-                }
-            } else {
-                log.info("\n\tDirect route is more efficient despite missing items or does not meet min savings, traveling directly");
-                setTarget(null); // Clear target to avoid conflicts
-                return walkWithStateInternal(target, distance);
-            }
         }
 
+        // Decide whether banking route is worth it
+        int minBankRouteSavings = config != null ? config.minBankRouteSavings() : 0;
+        boolean bankRouteIsBetter = !comparison.isDirectIsFaster()
+                && comparison.getTileSavings() >= minBankRouteSavings;
 
+        if ((forceBanking || bankRouteIsBetter) && comparison.getNearestBank() != null) {
+            log.info("Using banking route: Start: {} -> Bank: {} -> Target: {}",
+                    Rs2Player.getWorldLocation(), comparison.getBankLocation(), target);
+            return walkWithBankingState(comparison.getBankLocation(), missingItemsWithQuantities, target, distance);
+        }
+
+        if (forceBanking && comparison.getNearestBank() == null) {
+            log.warn("Banking route requested but no accessible bank found, trying direct route");
+        } else {
+            log.info("Direct route is more efficient, traveling directly");
+        }
+        setTarget(null);
+        return walkWithStateInternal(target, distance);
     }
 
 
