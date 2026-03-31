@@ -3308,66 +3308,65 @@ public class Rs2Walker {
             log.error("Please do not call the walker from the main thread");
             return WalkerState.EXIT;
         }
-        if (Rs2Tile.getReachableTilesFromTile(Rs2Player.getWorldLocation(), distance).containsKey(target)
-                || !Rs2Tile.isWalkable(LocalPoint.fromWorld(Microbot.getClient().getTopLevelWorldView(), target)) && Rs2Player.getWorldLocation().distanceTo(target) <= distance) {
+
+        boolean reachable = Rs2Tile.getReachableTilesFromTile(Rs2Player.getWorldLocation(), distance).containsKey(target);
+        boolean unwalkableButClose = !Rs2Tile.isWalkable(LocalPoint.fromWorld(Microbot.getClient().getTopLevelWorldView(), target))
+                && Rs2Player.getWorldLocation().distanceTo(target) <= distance;
+        if (reachable || unwalkableButClose) {
             return WalkerState.ARRIVED;
         }
+
         final Pathfinder pathfinder = ShortestPathPlugin.getPathfinder();
-        if (pathfinder != null && !pathfinder.isDone())
-            return WalkerState.MOVING;
-        if ((currentTarget != null && currentTarget.equals(target)) && ShortestPathPlugin.getMarker() != null){
+        if (pathfinder != null && !pathfinder.isDone()) {
             return WalkerState.MOVING;
         }
-        Rs2Walker.currentTarget =  null;
-        // Check what transport items are needed
-        TransportRouteAnalysis comparison = compareRoutes(target);
-        List<Transport> missingTransports = getMissingTransports(getTransportsForDestination(target, true, TransportType.TELEPORTATION_SPELL));
+        if (currentTarget != null && currentTarget.equals(target) && ShortestPathPlugin.getMarker() != null) {
+            return WalkerState.MOVING;
+        }
 
+        Rs2Walker.currentTarget = null;
+
+        // Analyze routes and check for missing transport items
+        TransportRouteAnalysis comparison = compareRoutes(target);
+        List<Transport> missingTransports = getMissingTransports(
+                getTransportsForDestination(target, true, TransportType.TELEPORTATION_SPELL));
         Map<Integer, Integer> missingItemsWithQuantities = getMissingTransportItemIdsWithQuantities(missingTransports);
-        if(!missingTransports.isEmpty()){
-            log.info("\n\tFor {} transports to destination in the bank to target {} we found {} missing items",
+
+        if (!missingTransports.isEmpty()) {
+            log.info("For {} transports to target {} we found {} missing items",
                     missingTransports.size(), target, missingItemsWithQuantities.size());
         }
-        // If no missing transport items, go directly
-        if (missingItemsWithQuantities.isEmpty() && !forceBanking) {
-            log.info("\n\tNo missing transport items, traveling directly to: \n\t" + target);
-            setTarget(null); // Clear target to avoid conflicts
-            WalkerState state = walkWithStateInternal(target, distance);
-            if (state == WalkerState.ARRIVED) {
-                log.info("\n\tArrived directly at target: " + target);
-            } else {
-                log.warn("\n\tFailed to arrive directly at target: " + target + ", state: " + state);
-                setTarget(null);
-                return state;
 
+        // If no missing transport items and not forced to bank, go directly
+        if (missingItemsWithQuantities.isEmpty() && !forceBanking) {
+            log.info("No missing transport items, traveling directly to: {}", target);
+            setTarget(null);
+            WalkerState state = walkWithStateInternal(target, distance);
+            if (state != WalkerState.ARRIVED) {
+                log.warn("Failed to arrive directly at target: {}, state: {}", target, state);
+                setTarget(null);
             }
             return state;
-        } else {
-            // Compare routes if we have missing items that could be obtained from bank
-            // Use config for minimum bank route savings
-            int minBankRouteSavings = config != null ? config.minBankRouteSavings() : 0;
-            int tileSavings = comparison.getTileSavings();
-            boolean bankRouteIsBetter = !comparison.isDirectIsFaster() && tileSavings >= minBankRouteSavings;
-            // If forced banking or banking route is more efficient (with min savings), go via bank
-            if (forceBanking || bankRouteIsBetter) {
-                if (comparison.getNearestBank() != null) {
-                    log.info("\n\tUsing banking route: \n\t\tStart: {} -> Bank: {} -> Target: {}",
-                            Rs2Player.getWorldLocation(), comparison.getBankLocation(), target);
-                    // Handle the complete banking workflow using legacy walkTo approach
-                    return walkWithBankingState(comparison.getBankLocation(), missingItemsWithQuantities, target, distance);
-                } else {
-                    log.warn("\n\tBanking route requested but no accessible bank found, trying direct route");
-                    setTarget(null); // Clear target to avoid conflicts
-                    return walkWithStateInternal(target, distance);
-                }
-            } else {
-                log.info("\n\tDirect route is more efficient despite missing items or does not meet min savings, traveling directly");
-                setTarget(null); // Clear target to avoid conflicts
-                return walkWithStateInternal(target, distance);
-            }
         }
 
+        // Decide whether banking route is worth it
+        int minBankRouteSavings = config != null ? config.minBankRouteSavings() : 0;
+        boolean bankRouteIsBetter = !comparison.isDirectIsFaster()
+                && comparison.getTileSavings() >= minBankRouteSavings;
 
+        if ((forceBanking || bankRouteIsBetter) && comparison.getNearestBank() != null) {
+            log.info("Using banking route: Start: {} -> Bank: {} -> Target: {}",
+                    Rs2Player.getWorldLocation(), comparison.getBankLocation(), target);
+            return walkWithBankingState(comparison.getBankLocation(), missingItemsWithQuantities, target, distance);
+        }
+
+        if (forceBanking && comparison.getNearestBank() == null) {
+            log.warn("Banking route requested but no accessible bank found, trying direct route");
+        } else {
+            log.info("Direct route is more efficient, traveling directly");
+        }
+        setTarget(null);
+        return walkWithStateInternal(target, distance);
     }
 
 
