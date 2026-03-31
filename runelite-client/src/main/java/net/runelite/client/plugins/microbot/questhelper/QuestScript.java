@@ -109,8 +109,14 @@ public class QuestScript extends Script {
 
                         for (var dialogChoice : dialogChoices) {
                             if (dialogChoice.getText().endsWith(choice.getChoice())) {
-                                Rs2Keyboard.keyPress(dialogChoice.getOnKeyListener()[7].toString().charAt(0));
-                                return;
+                                Object[] keyListener = dialogChoice.getOnKeyListener();
+                                if (keyListener != null && keyListener.length > 7 && keyListener[7] != null) {
+                                    String keyStr = keyListener[7].toString();
+                                    if (!keyStr.isEmpty()) {
+                                        Rs2Keyboard.keyPress(keyStr.charAt(0));
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
