@@ -1415,212 +1415,280 @@ public class Rs2Walker {
     private static boolean handleTransports(List<WorldPoint> path, int indexOfStartPoint) {
         Set<Transport> transports = ShortestPathPlugin.getTransports().getOrDefault(path.get(indexOfStartPoint), new HashSet<>());
         log.debug("Found transports: {}", transports.stream().map(Transport::getDisplayInfo).collect(Collectors.joining(", ")));
+
         for (Transport transport : transports) {
-            Collection<WorldPoint> worldPointCollections;
-            //in some cases the getOrigin is null, for teleports that start the player location
+            Collection<WorldPoint> originPoints;
             if (transport.getOrigin() == null) {
-                worldPointCollections = Collections.singleton(null);
+                originPoints = Collections.singleton(null);
             } else {
-                worldPointCollections = WorldPoint.toLocalInstance(Microbot.getClient().getTopLevelWorldView(), transport.getOrigin());
+                originPoints = WorldPoint.toLocalInstance(Microbot.getClient().getTopLevelWorldView(), transport.getOrigin());
             }
             log.debug("Considering transport: {}", transport.getDisplayInfo());
-            for (WorldPoint origin : worldPointCollections) {
+
+            for (WorldPoint origin : originPoints) {
                 if (transport.getOrigin() != null && Rs2Player.getWorldLocation().getPlane() != transport.getOrigin().getPlane()) {
                     continue;
                 }
 
                 for (int i = indexOfStartPoint; i < path.size(); i++) {
-                    if (origin != null && origin.getPlane() != Rs2Player.getWorldLocation().getPlane())
+                    if (!isTransportApplicable(transport, path, origin)) {
                         continue;
-                    if (path.stream().noneMatch(x -> x.equals(transport.getDestination()))) continue;
-                    if (TransportType.isTeleport(transport.getType()) && Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 3) continue;
-
-                    // we don't need to check for teleportation_item & teleportation_spell as they will be set on the first tile
-                    if (!TransportType.isTeleport(transport.getType())) {
-                        int indexOfOrigin = IntStream.range(0, path.size())
-                                .filter(f -> path.get(f).equals(transport.getOrigin()))
-                                .findFirst()
-                                .orElse(-1);
-                        int indexOfDestination = IntStream.range(0, path.size())
-                                .filter(f -> path.get(f).equals(transport.getDestination()))
-                                .findFirst()
-                                .orElse(-1);
-                        if (indexOfDestination == -1) continue;
-                        if (indexOfOrigin == -1) continue;
-                        if (indexOfDestination < indexOfOrigin) continue;
                     }
 
+                    // Origin-matched transports: NPC-based and charter ships
                     if (path.get(i).equals(origin)) {
-                        if (transport.getType() == TransportType.SHIP || transport.getType() == TransportType.NPC || transport.getType() == TransportType.BOAT) {
-
-                            Rs2NpcModel npc = Rs2Npc.getNpc(transport.getName());
-
-                            if (Rs2Npc.canWalkTo(npc, 20) && Rs2Npc.interact(npc, transport.getAction())) {
-                                Rs2Player.waitForWalking();
-                                sleepUntil(Rs2Dialogue::isInDialogue,600*2);
-
-                                if (Objects.equals(transport.getName(), "Veos") && Objects.equals(transport.getAction(), "Talk-to")) {
-                                    sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
-                                    Rs2Dialogue.clickOption("Can you take me somewhere?");
-                                    sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
-                                    Rs2Dialogue.clickOption(transport.getDisplayInfo());
-                                    sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
-                                }
-
-                                if (Objects.equals(transport.getName(), "Captain Magoro") && Objects.equals(transport.getAction(), "Talk-to")) {
-                                    sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
-                                    Rs2Dialogue.clickOption(transport.getDisplayInfo());
-                                    sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
-                                }
-
-                                if (Rs2Dialogue.clickOption("I'm just going to Pirates' cove")){
-                                    sleep(600 * 2);
-                                    Rs2Dialogue.clickContinue();
-                                } else if (Objects.equals(transport.getName(), "Mountain Guide")) {
-                                    Rs2Dialogue.clickOption(transport.getDisplayInfo());
-                                }
-                                sleepUntil(() -> !Rs2Player.isAnimating());
-                                sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
-                                sleep(600 * 6);
-                            } else {
-                                Rs2Walker.walkFastCanvas(path.get(i));
-                                sleep(1200, 1600);
-                            }
-                        }
-
-                        if (transport.getType() == TransportType.CHARTER_SHIP) {
-                            if (handleCharterShip(transport)) {
-                                sleepUntil(() -> !Rs2Player.isAnimating());
-                                sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
-                                sleep(600 * 4); // wait 4 extra ticks before walking
-                                break;
-                            }
+                        if (handleOriginMatchedTransport(transport, path, i)) {
+                            return true;
                         }
                     }
 
+                    // Type-dispatched transports (not origin-dependent)
                     log.debug("Handling {} transport: {}", transport.getType(), transport.getDisplayInfo());
-                    if (transport.getType() == TransportType.POH) {
-                        if (handlePohTransport(transport)) {
-                            sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET, 10000);
-                            break;
-                        }
+                    boolean handled = dispatchTransportByType(transport);
+                    if (handled) {
+                        return true;
                     }
 
-                    if (transport.getType() == TransportType.CANOE) {
-                        if (handleCanoe(transport)) {
-                            sleep(600 * 2); // wait 2 extra ticks before walking
-                            break;
-                        }
+                    // Fallback: generic object-based transport
+                    if (handleGenericObjectTransport(transport)) {
+                        return true;
                     }
 
-                    if (transport.getType() == TransportType.SPIRIT_TREE) {
-                        if (handleSpiritTree(transport)) {
-                            sleepUntil(() -> !Rs2Player.isAnimating());
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.QUETZAL) {
-                        if (handleQuetzal(transport)) {
-                            sleep(600 * 2); // wait 2 extra ticks before walking
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.MAGIC_CARPET) {
-                        if (handleMagicCarpet(transport)) {
-                            sleep(600 * 2); // wait 2 extra ticks before walking
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.WILDERNESS_OBELISK) {
-                        if (handleWildernessObelisk(transport)) {
-                            sleep(600 * 2);
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.GNOME_GLIDER) {
-                        if (handleGlider(transport)) {
-                            sleepUntil(() -> !Rs2Player.isAnimating());
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
-                            sleep(600 * 3); // wait 3 extra ticks before walking
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.FAIRY_RING && !Rs2Player.getWorldLocation().equals(transport.getDestination())) {
-                        if (handleFairyRing(transport)) {
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.TELEPORTATION_MINIGAME) {
-                        if (handleMinigameTeleport(transport)) {
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < (OFFSET * 2));
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.TELEPORTATION_ITEM) {
-                        if (handleTeleportItem(transport)) {
-                            sleepUntil(() -> !Rs2Player.isAnimating());
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
-                            break;
-                        }
-                    }
-
-                    if (transport.getType() == TransportType.TELEPORTATION_SPELL) {
-                        if (handleTeleportSpell(transport)) {
-                            sleepUntil(() -> !Rs2Player.isAnimating());
-                            sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
-                            Rs2Tab.switchTo(InterfaceTab.INVENTORY);
-                            break;
-                        }
-                    }
-
-                    if (transport.getObjectId() <= 0) break;
-
-                    // Use class-level constants for object ID mapping
-                    List<Integer> objectIdsToSearch = new ArrayList<>();
-                    objectIdsToSearch.add(transport.getObjectId());
-
-                    // If this transport is for an open trapdoor, also search for the closed version
-                    if (OPEN_TO_CLOSED_MAPPINGS.containsKey(transport.getObjectId())) {
-                        objectIdsToSearch.add(OPEN_TO_CLOSED_MAPPINGS.get(transport.getObjectId()));
-                    }
-
-                    List<TileObject> objects = Rs2GameObject.getAll(o -> objectIdsToSearch.contains(o.getId()), transport.getOrigin(), 10).stream()
-                            .sorted(Comparator.comparingInt(o -> o.getWorldLocation().distanceTo(transport.getOrigin())))
-                            .collect(Collectors.toList());
-
-                    TileObject object = objects.stream().findFirst().orElse(null);
-                    if (object instanceof GroundObject) {
-                        object = objects.stream()
-                                .filter(o -> !Objects.equals(o.getWorldLocation(), Rs2Player.getWorldLocation()))
-                                .min(Comparator.comparing(o -> ((TileObject) o).getWorldLocation().distanceTo(transport.getOrigin()))
-                                        .thenComparing(o -> ((TileObject) o).getWorldLocation().distanceTo(transport.getDestination()))).orElse(null);
-                    }
-
-                    if (object != null) {
-                        // Skip reachability check for GroundObjects and Magic Mushtrees
-                        if (!(object instanceof GroundObject) && !MagicMushtree.isMagicMushtree(transport.getObjectId())) {
-                            if (!Rs2Tile.isTileReachable(transport.getOrigin())) {
-                                break;
-                            }
-                        }
-
-                        handleObject(transport, object);
-                        sleepUntil(() -> !Rs2Player.isAnimating());
-                        return sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
-                    }
+                    break;
                 }
             }
         }
         return false;
+    }
+
+    /**
+     * Checks whether a transport is applicable at the current path position.
+     */
+    private static boolean isTransportApplicable(Transport transport, List<WorldPoint> path, WorldPoint origin) {
+        if (origin != null && origin.getPlane() != Rs2Player.getWorldLocation().getPlane()) {
+            return false;
+        }
+        if (path.stream().noneMatch(x -> x.equals(transport.getDestination()))) {
+            return false;
+        }
+        if (TransportType.isTeleport(transport.getType()) && Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 3) {
+            return false;
+        }
+        if (!TransportType.isTeleport(transport.getType())) {
+            int indexOfOrigin = IntStream.range(0, path.size())
+                    .filter(f -> path.get(f).equals(transport.getOrigin()))
+                    .findFirst().orElse(-1);
+            int indexOfDestination = IntStream.range(0, path.size())
+                    .filter(f -> path.get(f).equals(transport.getDestination()))
+                    .findFirst().orElse(-1);
+            if (indexOfDestination == -1 || indexOfOrigin == -1 || indexOfDestination < indexOfOrigin) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Handles transports that require the player to be at the origin tile:
+     * NPC-based transports (ships, boats, NPCs) and charter ships.
+     * @return true if the transport was handled
+     */
+    private static boolean handleOriginMatchedTransport(Transport transport, List<WorldPoint> path, int pathIndex) {
+        TransportType type = transport.getType();
+
+        if (type == TransportType.SHIP || type == TransportType.NPC || type == TransportType.BOAT) {
+            return handleNpcTransport(transport, path, pathIndex);
+        }
+
+        if (type == TransportType.CHARTER_SHIP) {
+            if (handleCharterShip(transport)) {
+                sleepUntil(() -> !Rs2Player.isAnimating());
+                sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
+                sleep(600 * 4);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Handles NPC-based transports (ships, boats, NPCs) including special dialogue
+     * handling for specific NPCs like Veos, Captain Magoro, and Mountain Guide.
+     */
+    private static boolean handleNpcTransport(Transport transport, List<WorldPoint> path, int pathIndex) {
+        Rs2NpcModel npc = Rs2Npc.getNpc(transport.getName());
+
+        if (!Rs2Npc.canWalkTo(npc, 20) || !Rs2Npc.interact(npc, transport.getAction())) {
+            Rs2Walker.walkFastCanvas(path.get(pathIndex));
+            sleep(1200, 1600);
+            return false;
+        }
+
+        Rs2Player.waitForWalking();
+        sleepUntil(Rs2Dialogue::isInDialogue, 600 * 2);
+
+        if (Objects.equals(transport.getName(), "Veos") && Objects.equals(transport.getAction(), "Talk-to")) {
+            sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+            Rs2Dialogue.clickOption("Can you take me somewhere?");
+            sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+            Rs2Dialogue.clickOption(transport.getDisplayInfo());
+            sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+        }
+
+        if (Objects.equals(transport.getName(), "Captain Magoro") && Objects.equals(transport.getAction(), "Talk-to")) {
+            sleepUntil(() -> !Rs2Dialogue.hasContinue(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+            Rs2Dialogue.clickOption(transport.getDisplayInfo());
+            sleepUntil(() -> !Rs2Dialogue.hasContinue() && !Rs2Dialogue.hasSelectAnOption(), Rs2Dialogue::clickContinue, 5000, Rs2Random.between(600, 800));
+        }
+
+        if (Rs2Dialogue.clickOption("I'm just going to Pirates' cove")) {
+            sleep(600 * 2);
+            Rs2Dialogue.clickContinue();
+        } else if (Objects.equals(transport.getName(), "Mountain Guide")) {
+            Rs2Dialogue.clickOption(transport.getDisplayInfo());
+        }
+
+        sleepUntil(() -> !Rs2Player.isAnimating());
+        sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
+        sleep(600 * 6);
+        return true;
+    }
+
+    /**
+     * Dispatches transport handling based on transport type.
+     * @return true if the transport was successfully handled
+     */
+    private static boolean dispatchTransportByType(Transport transport) {
+        switch (transport.getType()) {
+            case POH:
+                if (handlePohTransport(transport)) {
+                    sleepUntil(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET, 10000);
+                    return true;
+                }
+                return false;
+
+            case CANOE:
+                if (handleCanoe(transport)) {
+                    sleep(600 * 2);
+                    return true;
+                }
+                return false;
+
+            case SPIRIT_TREE:
+                if (handleSpiritTree(transport)) {
+                    sleepUntil(() -> !Rs2Player.isAnimating());
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
+                    return true;
+                }
+                return false;
+
+            case QUETZAL:
+                if (handleQuetzal(transport)) {
+                    sleep(600 * 2);
+                    return true;
+                }
+                return false;
+
+            case MAGIC_CARPET:
+                if (handleMagicCarpet(transport)) {
+                    sleep(600 * 2);
+                    return true;
+                }
+                return false;
+
+            case WILDERNESS_OBELISK:
+                if (handleWildernessObelisk(transport)) {
+                    sleep(600 * 2);
+                    return true;
+                }
+                return false;
+
+            case GNOME_GLIDER:
+                if (handleGlider(transport)) {
+                    sleepUntil(() -> !Rs2Player.isAnimating());
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < 10);
+                    sleep(600 * 3);
+                    return true;
+                }
+                return false;
+
+            case FAIRY_RING:
+                if (!Rs2Player.getWorldLocation().equals(transport.getDestination()) && handleFairyRing(transport)) {
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
+                    return true;
+                }
+                return false;
+
+            case TELEPORTATION_MINIGAME:
+                if (handleMinigameTeleport(transport)) {
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < (OFFSET * 2));
+                    return true;
+                }
+                return false;
+
+            case TELEPORTATION_ITEM:
+                if (handleTeleportItem(transport)) {
+                    sleepUntil(() -> !Rs2Player.isAnimating());
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
+                    return true;
+                }
+                return false;
+
+            case TELEPORTATION_SPELL:
+                if (handleTeleportSpell(transport)) {
+                    sleepUntil(() -> !Rs2Player.isAnimating());
+                    sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
+                    Rs2Tab.switchTo(InterfaceTab.INVENTORY);
+                    return true;
+                }
+                return false;
+
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Handles transports backed by game objects (trapdoors, ladders, shortcuts, etc).
+     * @return true if the transport was handled via an object interaction
+     */
+    private static boolean handleGenericObjectTransport(Transport transport) {
+        if (transport.getObjectId() <= 0) {
+            return false;
+        }
+
+        List<Integer> objectIdsToSearch = new ArrayList<>();
+        objectIdsToSearch.add(transport.getObjectId());
+        if (OPEN_TO_CLOSED_MAPPINGS.containsKey(transport.getObjectId())) {
+            objectIdsToSearch.add(OPEN_TO_CLOSED_MAPPINGS.get(transport.getObjectId()));
+        }
+
+        List<TileObject> objects = Rs2GameObject.getAll(o -> objectIdsToSearch.contains(o.getId()), transport.getOrigin(), 10).stream()
+                .sorted(Comparator.comparingInt(o -> o.getWorldLocation().distanceTo(transport.getOrigin())))
+                .collect(Collectors.toList());
+
+        TileObject object = objects.stream().findFirst().orElse(null);
+        if (object instanceof GroundObject) {
+            object = objects.stream()
+                    .filter(o -> !Objects.equals(o.getWorldLocation(), Rs2Player.getWorldLocation()))
+                    .min(Comparator.comparing(o -> ((TileObject) o).getWorldLocation().distanceTo(transport.getOrigin()))
+                            .thenComparing(o -> ((TileObject) o).getWorldLocation().distanceTo(transport.getDestination()))).orElse(null);
+        }
+
+        if (object == null) {
+            return false;
+        }
+
+        // Skip reachability check for GroundObjects and Magic Mushtrees
+        if (!(object instanceof GroundObject) && !MagicMushtree.isMagicMushtree(transport.getObjectId())) {
+            if (!Rs2Tile.isTileReachable(transport.getOrigin())) {
+                return false;
+            }
+        }
+
+        handleObject(transport, object);
+        sleepUntil(() -> !Rs2Player.isAnimating());
+        return sleepUntilTrue(() -> Rs2Player.getWorldLocation().distanceTo(transport.getDestination()) < OFFSET);
     }
 
     /**
