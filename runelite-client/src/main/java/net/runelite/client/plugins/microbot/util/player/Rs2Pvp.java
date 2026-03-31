@@ -32,6 +32,7 @@ import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.microbot.Microbot;
 import net.runelite.client.plugins.microbot.util.player.Rs2Player;
 import net.runelite.client.util.QuantityFormatter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.ArrayUtils;
 
 import java.awt.*;
@@ -41,6 +42,7 @@ import java.util.Objects;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
+@Slf4j
 public class Rs2Pvp {
     private static final Polygon NOT_WILDERNESS_BLACK_KNIGHTS = new Polygon( // this is black knights castle
             new int[]{2994, 2995, 2996, 2996, 2994, 2994, 2997, 2998, 2998, 2999, 3000, 3001, 3002, 3003, 3004, 3005, 3005,
@@ -162,15 +164,21 @@ public class Rs2Pvp {
         int wildernessLevel = 0;
         boolean isDeadManWorld = WorldType.isDeadmanWorld(Microbot.getClient().getWorldType());
         boolean isPVPWorld = WorldType.isPvpWorld(Microbot.getClient().getWorldType());
+        if (isDeadManWorld) {
+            return !players.isEmpty();
+        }
+        if (isPVPWorld) {
+            wildernessLevel += 15;
+        }
         if (Microbot.getVarbitValue(Varbits.IN_WILDERNESS) == 1) {
             wildernessLevel += getWildernessLevelFrom(Rs2Player.getWorldLocation());
         }
         for (Rs2PlayerModel player: players) {
             if (!isAttackable(player, isDeadManWorld, isPVPWorld, wildernessLevel)) continue;
-            System.out.println("Player: " + player.getName() + " with combat " + player.getCombatLevel() + " detected!");
+            log.debug("Player: {} with combat {} detected!", player.getName(), player.getCombatLevel());
             return true;
         }
-        System.out.println("No attackable players detected...");
+        log.debug("No attackable players detected...");
         return false;
     }
 

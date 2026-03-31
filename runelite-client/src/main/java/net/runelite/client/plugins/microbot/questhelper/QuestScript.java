@@ -98,19 +98,27 @@ public class QuestScript extends Script {
 
                 if (questStep != null && Rs2Widget.isWidgetVisible(ComponentID.DIALOG_OPTION_OPTIONS)) {
                     var dialogOptions = Rs2Widget.getWidget(ComponentID.DIALOG_OPTION_OPTIONS);
-                    var dialogChoices = dialogOptions.getDynamicChildren();
+                    if (dialogOptions != null) {
+                        var dialogChoices = dialogOptions.getDynamicChildren();
 
-                    for (var choice : questStep.getChoices().getChoices()) {
-                        if (choice.getExpectedPreviousLine() != null)
-                            continue; // TODO
+                        for (var choice : questStep.getChoices().getChoices()) {
+                            if (choice.getExpectedPreviousLine() != null)
+                                continue; // TODO
 
-                        if (choice.getExcludedStrings() != null && choice.getExcludedStrings().stream().anyMatch(Rs2Widget::hasWidget))
-                            continue;
+                            if (choice.getExcludedStrings() != null && choice.getExcludedStrings().stream().anyMatch(Rs2Widget::hasWidget))
+                                continue;
 
-                        for (var dialogChoice : dialogChoices) {
-                            if (dialogChoice.getText().endsWith(choice.getChoice())) {
-                                Rs2Keyboard.keyPress(dialogChoice.getOnKeyListener()[7].toString().charAt(0));
-                                return;
+                            for (var dialogChoice : dialogChoices) {
+                                if (dialogChoice.getText().endsWith(choice.getChoice())) {
+                                    Object[] keyListener = dialogChoice.getOnKeyListener();
+                                    if (keyListener != null && keyListener.length > 7 && keyListener[7] != null) {
+                                        String keyStr = keyListener[7].toString();
+                                        if (!keyStr.isEmpty()) {
+                                            Rs2Keyboard.keyPress(keyStr.charAt(0));
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -127,7 +135,9 @@ public class QuestScript extends Script {
                         var widget = Rs2Widget.getWidget(widgetHighlight.getInterfaceID());
                         if (widget != null) {
                             if (widgetHighlight.getChildChildId() != -1) {
-                                var childWidget = widget.getChildren()[widgetHighlight.getChildChildId()];
+                                Widget[] children = widget.getChildren();
+                                if (children == null || widgetHighlight.getChildChildId() >= children.length) continue;
+                                var childWidget = children[widgetHighlight.getChildChildId()];
                                 if (childWidget != null) {
                                     Rs2Widget.clickWidget(childWidget.getId());
                                     return;

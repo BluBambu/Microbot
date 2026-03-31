@@ -330,10 +330,9 @@ public class AutoLoginScript extends Script {
                         LoginManager.getGameState(), LoginManager.isLoginAttemptActive());
             }
 
-
         } catch (Exception ex) {
             log.error("Error during intelligent login", ex);
-            retryCount++;
+            // retryCount already incremented before the login call
             lastLoginAttemptTime = Instant.now();
         }
     }

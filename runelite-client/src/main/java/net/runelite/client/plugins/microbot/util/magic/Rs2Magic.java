@@ -193,6 +193,10 @@ public class Rs2Magic {
 
         if(quickCanCast(magicSpell)) {
             Widget widget = Rs2Widget.findWidget(magicSpell.getName());
+            if (widget == null) {
+                log("Unable to find widget for " + magicSpell.getName());
+                return false;
+            }
             Microbot.click(widget.getBounds());
             return true;
         }
