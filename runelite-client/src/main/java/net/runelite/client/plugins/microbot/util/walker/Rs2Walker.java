@@ -1070,6 +1070,8 @@ public class Rs2Walker {
                     ? Rs2WorldPoint.convertInstancedWorldPoint(rawDoorWp)
                     : rawDoorWp;
 
+            if (doorWp == null) continue;
+
             List<WorldPoint> probes = new ArrayList<>();
             probes.add(doorWp);
             if (diagonal) {
